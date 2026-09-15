@@ -84,8 +84,9 @@ fun GlassSurface(
                     blur(blurRadius.toPx())
                     lens(refraction.toPx(), depth.toPx())
                 },
-                // 关闭默认高光描边，避免玻璃块出现一圈白色边框。
+                // 关闭默认高光描边（避免白色边框）与默认外投影（避免玻璃块带阴影）。
                 highlight = null,
+                shadow = null,
                 onDrawSurface = { drawRect(tint.copy(alpha = alpha)) }
             )
             .then(
