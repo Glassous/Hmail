@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import Icon from './Icon.vue'
+import BrandIcon from './BrandIcon.vue'
 import { api, ApiError, setCsrf } from './api'
 
 type Account = {id:string; email:string; provider:string; status:string}
@@ -11,13 +12,13 @@ const user = ref<any>(null), booting = ref(true), config = ref({oauthEnabled:fal
 const authMode = ref('login'), authBusy = ref(false), auth = reactive({username:'', password:'', question:'', answer:'', newPassword:''}), recoveryToken = ref(''), recoveryAsked = ref(false)
 const accounts = ref<Account[]>([]), activeId = ref(''), folder = ref('INBOX'), query = ref(''), appliedQuery = ref(''), labels = ref<Label[]>([])
 const items = ref<Mail[]>([]), messages = ref<Mail[]>([]), selected = ref<string[]>([]), activeThread = ref(''), nextCursor = ref(''), cursors = ref(['']), pageIndex = ref(0)
-const loading = ref(false), reading = ref(false), syncing = ref(false), sidebar = ref(false), modal = ref(''), error = ref(''), notice = ref(''), theme = ref(localStorage.getItem('fia-theme') || 'light')
+const loading = ref(false), reading = ref(false), syncing = ref(false), sidebar = ref(false), modal = ref(''), error = ref(''), notice = ref(''), theme = ref<'system'|'light'|'dark'>((localStorage.getItem('fia-theme') as 'system'|'light'|'dark') || 'system')
 const connectionBusy = ref(false), imap = reactive({email:'',password:'',port:465}), showImap = ref(false), changingPassword = reactive({currentPassword:'',password:'',question:'',answer:''})
 const labelName = ref(''), labelEdit = ref<Label|null>(null), labelChoice = ref(''), actionBusy = ref(false)
 const composer = ref(false), composeAccount = ref(''), composingBusy = ref(false), uploading = ref(false), savedState = ref(''), composeDirty = ref(false), sendUncertain = ref(false)
 const freshCompose = () => ({to:'',cc:'',bcc:'',subject:'',text:'',inReplyTo:'',references:'',threadId:null as string|null,draftId:null as string|null,composeId:crypto.randomUUID(),version:0,attachments:[] as Attachment[]})
 const draft = reactive(freshCompose())
-let saveTimer: ReturnType<typeof setTimeout> | undefined, pollTimer: ReturnType<typeof setInterval> | undefined, toastTimer: ReturnType<typeof setTimeout> | undefined
+let saveTimer: ReturnType<typeof setTimeout> | undefined, toastTimer: ReturnType<typeof setTimeout> | undefined
 let savePromise: Promise<void> | null = null, loadGeneration = 0, readGeneration = 0
 const activeAccount = computed(() => accounts.value.find(a => a.id === activeId.value))
 const customLabels = computed(() => labels.value.filter(l => l.type === 'user'))
@@ -31,8 +32,23 @@ const sizeText = (value:number) => value > 1048576 ? (value/1048576).toFixed(1)+
 function toast(text:string) { notice.value = text; clearTimeout(toastTimer); toastTimer = setTimeout(()=>notice.value='',6000) }
 function fail(e:unknown) { error.value = e instanceof Error ? e.message : '操作失败，请稍后重试'; if(e instanceof ApiError && e.code === 'unauthorized') { user.value = null; setCsrf('') } }
 function path(suffix:string, aid=activeId.value) { return `/gmail-accounts/${encodeURIComponent(aid)}${suffix}` }
-watch(theme, value => { document.documentElement.classList.toggle('dark',value==='dark'); localStorage.setItem('fia-theme',value) },{immediate:true})
-async function toggleTheme() { theme.value = theme.value === 'dark' ? 'light':'dark'; if(user.value) try { await api('/me','PATCH',{theme:theme.value}) } catch(e) { fail(e) } }
+const systemMedia = typeof window !== 'undefined' ? window.matchMedia('(prefers-color-scheme: dark)') : null
+function applyTheme() {
+  const isDark = theme.value === 'dark' || (theme.value === 'system' && (systemMedia?.matches ?? false))
+  document.documentElement.classList.toggle('dark', isDark)
+}
+watch(theme, value => {
+  localStorage.setItem('fia-theme', value)
+  applyTheme()
+}, { immediate: true })
+async function setTheme(value: 'system' | 'light' | 'dark') {
+  theme.value = value
+  if (user.value) try { await api('/me', 'PATCH', { theme: value }) } catch(e) { fail(e) }
+}
+async function toggleTheme() {
+  const next = theme.value === 'system' ? 'light' : theme.value === 'light' ? 'dark' : 'system'
+  await setTheme(next)
+}
 
 async function submitAuth() {
   authBusy.value=true; error.value=''
@@ -84,7 +100,24 @@ async function modify(add:string[]=[],remove:string[]=[],action='labels',ids?:st
 }
 async function star(item:Mail) { await modify(item.labels.includes('STARRED')?[]:['STARRED'],item.labels.includes('STARRED')?['STARRED']:[],'labels',[item.id]) }
 function checkAll() { selected.value=allChecked.value?[]:items.value.map(m=>m.id) }
-async function allowImages(message:Mail) { try{const result=await api(path('/messages/'+encodeURIComponent(message.id))+'?remote=true'); message.html=result.html;toast('已允许本封邮件加载远程图片')}catch(e){fail(e)} }
+async function allowImages(message:Mail) { try{const result=await api(path('/messages/'+encodeURIComponent(message.id))+'?remote=true'); message.html=result.html;toast('已通过安全代理重新加载图片')}catch(e){fail(e)} }
+function onIframeLoad(e: Event) {
+  const iframe = e.target as HTMLIFrameElement
+  if (!iframe) return
+  try {
+    const doc = iframe.contentDocument || iframe.contentWindow?.document
+    if (doc?.documentElement) {
+      const resize = () => {
+        const height = Math.max(doc.body?.scrollHeight || 0, doc.documentElement.scrollHeight || 0)
+        if (height > 0) iframe.style.height = `${height + 24}px`
+      }
+      resize()
+      if (typeof window !== 'undefined' && 'ResizeObserver' in window && doc.body) {
+        new ResizeObserver(resize).observe(doc.body)
+      }
+    }
+  } catch {}
+}
 
 async function oauthConnect() { connectionBusy.value=true;try{const result=await api('/gmail-accounts/oauth/start','POST');location.assign(result.url)}catch(e){fail(e);connectionBusy.value=false} }
 async function imapConnect() { connectionBusy.value=true;try{const account=await api('/gmail-accounts/imap','POST',imap);imap.password='';modal.value='';await loadAccounts();activeId.value=account.id;toast('Gmail 已连接')}catch(e){fail(e)}finally{connectionBusy.value=false} }
@@ -138,24 +171,53 @@ async function sendMail() {
   catch(e){if(e instanceof ApiError&&e.code==='send_uncertain'){sendUncertain.value=true;savedState.value='发送结果待确认'}fail(e)}finally{composingBusy.value=false}
 }
 function beforeUnload(e:BeforeUnloadEvent) {if(composer.value&&(composeDirty.value||composingBusy.value)){e.preventDefault();e.returnValue=''}}
-function visibilityChanged(){if(document.visibilityState==='visible'&&user.value)void refresh(false)}
-onMounted(async()=>{try{config.value=await api('/config');auth.question=config.value.questions[0]||'';try{const session=await api('/me');user.value=session.user;setCsrf(session.csrf);theme.value=session.user.theme;await loadAccounts()}catch(e){if(!(e instanceof ApiError&&e.status===401))throw e}const result=new URLSearchParams(location.search).get('connection');if(result){toast(result==='success'?'Google 授权成功':'已取消 Google 授权');history.replaceState({},'',location.pathname)}}catch(e){fail(e)}finally{booting.value=false}pollTimer=setInterval(()=>{if(document.visibilityState==='visible'&&user.value)void refresh(false)},60000);document.addEventListener('visibilitychange',visibilityChanged);window.addEventListener('beforeunload',beforeUnload)})
-onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(saveTimer);clearTimeout(toastTimer);document.removeEventListener('visibilitychange',visibilityChanged);window.removeEventListener('beforeunload',beforeUnload)})
+onMounted(async()=>{
+  systemMedia?.addEventListener('change', applyTheme)
+  window.addEventListener('beforeunload', beforeUnload)
+  try {
+    config.value = await api('/config')
+    auth.question = config.value.questions[0] || ''
+    try {
+      const session = await api('/me')
+      user.value = session.user
+      setCsrf(session.csrf)
+      if (session.user.theme) theme.value = session.user.theme
+      await loadAccounts()
+    } catch(e) {
+      if (!(e instanceof ApiError && e.status === 401)) throw e
+    }
+    const result = new URLSearchParams(location.search).get('connection')
+    if (result) {
+      toast(result === 'success' ? 'Google 授权成功' : '已取消 Google 授权')
+      history.replaceState({}, '', location.pathname)
+    }
+  } catch(e) {
+    fail(e)
+  } finally {
+    booting.value = false
+  }
+})
+onUnmounted(()=>{
+  clearTimeout(saveTimer)
+  clearTimeout(toastTimer)
+  systemMedia?.removeEventListener('change', applyTheme)
+  window.removeEventListener('beforeunload', beforeUnload)
+})
 </script>
 
 <template>
   <div v-if="booting" class="flex min-h-screen items-center justify-center gap-3 text-slate-500"><Icon name="refresh" class="animate-spin"/>正在打开 FiaGmail…</div>
   <div v-else-if="!user" class="relative flex min-h-screen items-center justify-center p-5 lg:p-12">
-    <button class="icon-btn absolute right-6 top-6" aria-label="切换主题" @click="toggleTheme"><Icon :name="theme==='dark'?'sun':'moon'"/></button>
+    <button class="icon-btn absolute right-6 top-6" :title="theme==='system'?'跟随系统':theme==='light'?'浅色模式':'深色模式'" :aria-label="'切换主题，当前：'+(theme==='system'?'跟随系统':theme==='light'?'浅色模式':'深色模式')" @click="toggleTheme"><Icon :name="theme==='system'?'system':theme==='dark'?'moon':'sun'"/></button>
     <div class="grid w-full max-w-5xl overflow-hidden rounded-[32px] border divider surface shadow-xl shadow-slate-200/40 dark:shadow-none lg:grid-cols-2">
       <section class="relative hidden flex-col justify-between overflow-hidden bg-[#e8f0fe] p-12 text-slate-800 lg:flex">
-        <div class="flex items-center gap-3"><span class="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-600 text-white"><Icon name="mail" :size="25"/></span><span class="text-2xl font-semibold tracking-tight">FiaGmail<span class="text-blue-600">.</span></span></div>
+        <div class="flex items-center gap-3"><BrandIcon :size="44"/><span class="text-2xl font-semibold tracking-tight">FiaGmail<span class="text-blue-600">.</span></span></div>
         <div class="py-20"><div class="mb-5 text-xs font-semibold uppercase tracking-[.3em] text-blue-600">A little more organized</div><h1 class="text-4xl font-semibold leading-snug tracking-tight">让邮件归位，<br/>让思绪留白。</h1><p class="mt-5 max-w-xs text-sm leading-7 text-slate-500">连接你的 Gmail，让每一次收发都井然有序。熟悉的邮箱，更专注的空间。</p>
         <div class="mt-10 rotate-[-3deg] rounded-2xl bg-white/90 p-5 shadow-xl shadow-blue-200/30"><div class="flex items-center gap-3"><span class="flex h-10 w-10 items-center justify-center rounded-full bg-blue-100 text-blue-600"><Icon name="inbox"/></span><div><div class="text-sm font-semibold">给重要的事，多一点空间</div><div class="mt-1 text-xs text-slate-400">收发 · 整理 · 专注</div></div><Icon name="check" class="ml-auto text-blue-500"/></div><div class="mt-5 h-2 w-4/5 rounded bg-slate-100"></div><div class="mt-3 h-2 w-3/5 rounded bg-slate-100"></div></div></div>
         <p class="flex items-center gap-2 text-xs text-slate-500"><Icon name="shield" :size="16"/>你的邮箱，由你掌控</p>
       </section>
       <section class="p-8 sm:p-12 lg:p-14">
-        <div class="mb-12 flex items-center gap-2 text-xl font-semibold lg:hidden"><Icon name="mail" class="text-blue-600"/>FiaGmail.</div>
+        <div class="mb-12 flex items-center gap-2 text-xl font-semibold lg:hidden"><BrandIcon :size="32"/>FiaGmail.</div>
         <div class="mb-8"><p class="mb-3 text-xs font-medium tracking-widest text-blue-600">WELCOME TO FIAGMAIL</p><h2 class="text-3xl font-semibold tracking-tight">{{authMode==='login'?'欢迎回来':authMode==='register'?'创建你的账户':'找回密码'}}</h2><p class="mt-3 text-sm text-slate-500">{{authMode==='login'?'登录后，即可连接你的 Gmail 邮箱。':authMode==='register'?'从一个属于自己的邮件空间开始。':'通过注册时设置的密保问题验证身份。'}}</p></div>
         <form class="space-y-5" @submit.prevent="submitAuth">
           <label class="block text-sm">用户名<input v-model="auth.username" :disabled="authMode==='recover'&&recoveryAsked" required minlength="3" maxlength="40" pattern="[a-zA-Z0-9_-]+" autocomplete="username" class="field mt-2" placeholder="字母、数字、下划线或短横线"/></label>
@@ -174,19 +236,41 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(saveTimer);clearTimeout(t
   <div v-else class="flex h-dvh flex-col overflow-hidden">
     <header class="flex h-[76px] shrink-0 items-center gap-3 px-4 md:gap-5 md:px-6">
       <button class="icon-btn lg:hidden" aria-label="打开侧边栏" @click="sidebar=!sidebar"><Icon name="menu"/></button>
-      <a href="/" class="flex w-auto shrink-0 items-center gap-3 lg:w-[218px]" aria-label="FiaGmail 首页"><span class="flex h-9 w-9 items-center justify-center rounded-xl bg-blue-600 text-white"><Icon name="mail" :size="23"/></span><span class="hidden text-[23px] font-semibold tracking-tight sm:block">FiaGmail<span class="text-blue-600">.</span></span></a>
+      <a href="/" class="flex w-auto shrink-0 items-center gap-3 lg:w-[218px]" aria-label="FiaGmail 首页"><BrandIcon/><span class="hidden text-[23px] font-semibold tracking-tight sm:block">FiaGmail<span class="text-blue-600">.</span></span></a>
       <form class="flex h-12 min-w-0 max-w-3xl flex-1 items-center rounded-full bg-[#eaf0fa] px-4 dark:bg-slate-800" @submit.prevent="search"><Icon name="search" class="shrink-0 text-slate-500"/><input v-model="query" :disabled="!activeId" class="w-full bg-transparent px-3 text-sm outline-none focus-visible:ring-0" placeholder="搜索邮件" aria-label="搜索邮件，支持 Gmail 搜索语法"/><button v-if="query" type="button" class="text-slate-500" aria-label="清空搜索" @click="query='';search()"><Icon name="close" :size="16"/></button></form>
-      <div class="ml-auto flex items-center gap-1"><button class="icon-btn" aria-label="切换主题" @click="toggleTheme"><Icon :name="theme==='dark'?'sun':'moon'"/></button><button class="icon-btn hidden sm:flex" aria-label="账户设置" @click="modal='settings'"><Icon name="settings"/></button><button class="ml-2 flex h-9 w-9 items-center justify-center rounded-full bg-[#d3e3fd] text-sm font-semibold text-blue-800 ring-4 ring-white dark:ring-slate-800" :aria-label="user.username+' 的账户设置'" @click="modal='settings'">{{initials(user.username)}}</button></div>
+      <div class="ml-auto flex items-center"><button class="flex h-9 w-9 items-center justify-center rounded-full bg-[#d3e3fd] text-sm font-semibold text-blue-800 ring-4 ring-white dark:ring-slate-800" :aria-label="user.username+' 的账户设置'" @click="modal='settings'">{{initials(user.username)}}</button></div>
     </header>
     <div class="flex min-h-0 flex-1 pb-3 pr-3">
       <div v-if="sidebar" class="fixed inset-0 z-30 bg-slate-900/30 lg:hidden" @click="sidebar=false"></div>
       <aside class="fixed inset-y-0 left-0 z-40 flex w-[260px] shrink-0 flex-col bg-[#f6f8fc] px-4 pb-4 pt-6 transition-transform dark:bg-[#10151e] lg:static lg:translate-x-0 lg:pt-1" :class="sidebar?'translate-x-0':'-translate-x-full'">
+        <a href="/" class="mb-5 flex shrink-0 items-center gap-3 px-2 lg:hidden" aria-label="FiaGmail 首页"><BrandIcon :size="40"/><span class="text-lg font-semibold tracking-tight">FiaGmail<span class="text-violet-500">.</span></span></a>
         <button class="mb-6 ml-1 flex w-fit items-center gap-4 rounded-2xl bg-[#c2e7ff] px-6 py-4 font-medium text-[#16394f] shadow-sm transition hover:shadow-md" @click="newCompose()"><Icon name="edit" :size="22"/>写邮件</button>
         <div class="mb-4 px-2"><label class="caption mb-2 block uppercase tracking-wider" for="account-select">当前邮箱</label><select id="account-select" v-model="activeId" class="w-full truncate rounded-lg border-0 bg-transparent py-2 text-xs font-medium dark:bg-[#10151e]" :disabled="!accounts.length"><option v-if="!accounts.length" value="">尚未连接邮箱</option><option v-for="account in accounts" :key="account.id" :value="account.id">{{account.email}}</option></select></div>
         <nav class="space-y-1"><button v-for="n in nav" :key="n.id" class="flex w-full items-center gap-4 rounded-full px-5 py-2.5 text-sm transition" :class="folder===n.id?'bg-[#d3e3fd] font-semibold text-[#17365e] dark:bg-blue-900/50 dark:text-blue-200':'text-slate-600 hover:bg-slate-200/60 dark:text-slate-400 dark:hover:bg-slate-800'" :disabled="!activeId" @click="chooseFolder(n.id)"><Icon :name="n.icon" :size="19"/>{{n.name}}<span v-if="n.id==='INBOX'&&folder==='INBOX'&&items.filter(m=>m.labels.includes('UNREAD')).length" class="ml-auto text-xs">{{items.filter(m=>m.labels.includes('UNREAD')).length}}</span></button></nav>
         <div class="mt-7 flex items-center justify-between px-5"><span class="text-xs font-medium text-slate-500">标签</span><button class="text-slate-500 hover:text-blue-600" aria-label="新建标签" :disabled="!activeId" @click="labelEdit=null;labelName='';modal='label'"><Icon name="plus" :size="17"/></button></div>
         <div class="mt-2 min-h-0 overflow-y-auto"><div v-for="label in customLabels" :key="label.id" class="group flex items-center rounded-full" :class="folder===label.id?'bg-blue-100 dark:bg-blue-900/30':''"><button class="flex min-w-0 flex-1 items-center gap-4 px-5 py-2.5 text-sm text-slate-500" @click="chooseFolder(label.id)"><Icon name="tag" :size="17" class="shrink-0"/><span class="truncate">{{label.name}}</span></button><button class="mr-2 text-slate-400 opacity-0 focus:opacity-100 group-hover:opacity-100" :aria-label="'编辑标签 '+label.name" @click="labelEdit=label;labelName=label.name;modal='label'"><Icon name="edit" :size="14"/></button></div><p v-if="!customLabels.length" class="px-5 py-3 text-xs text-slate-400">用标签整理你的邮件</p></div>
-        <div class="mt-auto pt-6"><button class="flex w-full items-center gap-3 rounded-xl border border-dashed border-slate-300 px-4 py-3 text-xs text-slate-500 transition hover:border-blue-400 hover:text-blue-600 dark:border-slate-700" @click="modal='connect'"><Icon name="plus" :size="17"/>连接 Gmail 邮箱</button><div class="mt-4 flex items-center justify-between px-2 text-[10px] tracking-wide text-slate-400"><span>FIAGMAIL / LOCAL</span><span class="flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>本地运行</span></div></div>
+        <div class="mt-auto space-y-2 pt-4">
+          <div class="space-y-1.5">
+            <button class="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-xs font-medium text-slate-600 transition hover:bg-slate-200/60 dark:text-slate-400 dark:hover:bg-slate-800" aria-label="账户设置" @click="modal='settings'">
+              <Icon name="settings" :size="17"/>
+              <span>账户设置</span>
+            </button>
+            <div class="flex items-center rounded-xl bg-slate-200/60 p-1 dark:bg-slate-800/70" role="radiogroup" aria-label="主题模式选择">
+              <button type="button" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg py-1.5 text-xs transition" :class="theme==='system'?'bg-white font-medium text-blue-600 shadow-sm dark:bg-slate-700 dark:text-blue-300':'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'" title="跟随系统" :aria-checked="theme==='system'" role="radio" @click="setTheme('system')">
+                <Icon name="system" :size="14"/><span>系统</span>
+              </button>
+              <button type="button" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg py-1.5 text-xs transition" :class="theme==='light'?'bg-white font-medium text-blue-600 shadow-sm dark:bg-slate-700 dark:text-blue-300':'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'" title="浅色模式" :aria-checked="theme==='light'" role="radio" @click="setTheme('light')">
+                <Icon name="sun" :size="14"/><span>浅色</span>
+              </button>
+              <button type="button" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg py-1.5 text-xs transition" :class="theme==='dark'?'bg-white font-medium text-blue-600 shadow-sm dark:bg-slate-700 dark:text-blue-300':'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'" title="深色模式" :aria-checked="theme==='dark'" role="radio" @click="setTheme('dark')">
+                <Icon name="moon" :size="14"/><span>深色</span>
+              </button>
+            </div>
+          </div>
+          <button class="flex w-full items-center gap-3 rounded-xl border border-dashed border-slate-300 px-4 py-3 text-xs text-slate-500 transition hover:border-blue-400 hover:text-blue-600 dark:border-slate-700" @click="modal='connect'">
+            <Icon name="plus" :size="17"/>连接 Gmail 邮箱
+          </button>
+        </div>
       </aside>
       <main class="surface relative flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border divider lg:rounded-3xl">
         <template v-if="!activeId">
@@ -203,9 +287,21 @@ onUnmounted(()=>{clearInterval(pollTimer);clearTimeout(saveTimer);clearTimeout(t
             <div v-if="!activeThread" class="ml-auto flex shrink-0 items-center gap-1"><span class="mr-2 hidden text-xs text-slate-400 sm:inline">{{items.length?`第 ${pageIndex+1} 页 · ${items.length} 个会话`:'暂无邮件'}}</span><button class="icon-btn" :disabled="pageIndex===0||loading" aria-label="上一页" @click="paginate(-1)"><Icon name="chevron" :size="16" class="rotate-180"/></button><button class="icon-btn" :disabled="!nextCursor||loading" aria-label="下一页" @click="paginate(1)"><Icon name="chevron" :size="16"/></button></div>
           </div>
           <div v-if="loading&&!activeThread||reading" class="flex flex-1 items-center justify-center gap-3 text-sm text-slate-400"><Icon name="refresh" class="animate-spin"/>正在从 Gmail 加载…</div>
-          <div v-else-if="activeThread" class="flex-1 overflow-y-auto px-5 pb-10 sm:px-10"><h1 class="mb-6 mt-8 text-2xl font-medium leading-relaxed">{{messages[0]?.subject||'会话'}}</h1><article v-for="message in messages" :key="message.id" class="mb-5 border-b divider pb-6"><div class="flex items-start gap-3"><span class="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-blue-100 text-sm font-medium text-blue-700 dark:bg-blue-900/40 dark:text-blue-200">{{initials(message.from)}}</span><div class="min-w-0 flex-1"><div class="flex flex-wrap items-center gap-2"><span class="text-sm font-semibold">{{senderName(message.from)}}</span><span class="ml-auto text-xs text-slate-400">{{shortDate(message.date)}}</span><button class="icon-btn !h-8 !w-8" aria-label="切换星标" @click="star(message)"><Icon name="star" :size="17" :class="message.labels.includes('STARRED')?'fill-amber-400 text-amber-400':''"/></button></div><details class="text-xs text-slate-400"><summary class="cursor-pointer truncate">发送至 {{message.to}}</summary><div class="mt-2 space-y-1 break-all rounded-lg bg-slate-50 p-3 dark:bg-slate-800"><p>发件人：{{message.from}}</p><p>收件人：{{message.to}}</p><p v-if="message.cc">抄送：{{message.cc}}</p><p>{{message.date}}</p></div></details></div></div><div class="mt-5 sm:ml-13"><div v-if="message.html" class="mb-2 flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500 dark:bg-slate-800">远程图片默认关闭<button class="ml-auto text-blue-600" @click="allowImages(message)">加载图片</button></div><iframe v-if="message.html" :srcdoc="message.html" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" class="min-h-[380px] w-full rounded-lg border-0 bg-white" title="邮件正文"></iframe><pre v-else class="whitespace-pre-wrap break-words font-sans text-sm leading-7">{{message.text||'（无正文）'}}</pre><div v-if="message.attachments.length" class="mt-6 flex flex-wrap gap-2"><a v-for="attachment in message.attachments" :key="attachment.id" :href="'/api/v1'+path('/messages/'+encodeURIComponent(message.id)+'/attachments/'+encodeURIComponent(attachment.id))" class="flex max-w-full items-center gap-3 rounded-xl border divider px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800"><Icon name="attachment" :size="18" class="text-slate-400"/><span class="min-w-0"><span class="block truncate text-xs font-medium">{{attachment.name}}</span><span class="caption">{{sizeText(attachment.size)}}</span></span><Icon name="download" :size="15" class="text-slate-400"/></a></div><div class="mt-6 flex flex-wrap gap-2"><button class="secondary" @click="newCompose('reply',message)"><Icon name="reply" :size="16"/>回复</button><button class="secondary" @click="newCompose('replyAll',message)"><Icon name="replyAll" :size="16"/>回复全部</button><button class="secondary" @click="newCompose('forward',message)"><Icon name="forward" :size="16"/>转发</button></div></div></article></div>
+          <div v-else-if="activeThread" class="flex-1 overflow-y-auto px-5 pb-10 sm:px-10"><h1 class="mb-6 mt-8 text-2xl font-medium leading-relaxed">{{messages[0]?.subject||'会话'}}</h1><article v-for="message in messages" :key="message.id" class="mb-5 border-b divider pb-6"><div class="flex items-start gap-3"><span class="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-blue-100 text-sm font-medium text-blue-700 dark:bg-blue-900/40 dark:text-blue-200">{{initials(message.from)}}</span><div class="min-w-0 flex-1"><div class="flex flex-wrap items-center gap-2"><span class="text-sm font-semibold">{{senderName(message.from)}}</span><span class="ml-auto text-xs text-slate-400">{{shortDate(message.date)}}</span><button class="icon-btn !h-8 !w-8" aria-label="切换星标" @click="star(message)"><Icon name="star" :size="17" :class="message.labels.includes('STARRED')?'fill-amber-400 text-amber-400':''"/></button></div><details class="text-xs text-slate-400"><summary class="cursor-pointer truncate">发送至 {{message.to}}</summary><div class="mt-2 space-y-1 break-all rounded-lg bg-slate-50 p-3 dark:bg-slate-800"><p>发件人：{{message.from}}</p><p>收件人：{{message.to}}</p><p v-if="message.cc">抄送：{{message.cc}}</p><p>{{message.date}}</p></div></details></div></div><div class="mt-5 sm:ml-13">                <div v-if="message.html" class="overflow-hidden rounded-xl border border-slate-200/80 bg-white shadow-sm dark:border-slate-700/60">
+                  <iframe
+                    :key="message.id + '-' + (message.html?.length || 0)"
+                    :srcdoc="message.html"
+                    sandbox="allow-popups allow-popups-to-escape-sandbox allow-same-origin"
+                    referrerpolicy="no-referrer"
+                    class="w-full border-0 bg-white transition-[height] duration-150"
+                    style="min-height: 380px; height: 380px;"
+                    title="邮件正文"
+                    @load="onIframeLoad"
+                  ></iframe>
+                </div>
+                <pre v-else class="whitespace-pre-wrap break-words font-sans text-sm leading-7">{{message.text||'（无正文）'}}</pre><div v-if="message.attachments.length" class="mt-6 flex flex-wrap gap-2"><a v-for="attachment in message.attachments" :key="attachment.id" :href="'/api/v1'+path('/messages/'+encodeURIComponent(message.id)+'/attachments/'+encodeURIComponent(attachment.id))" class="flex max-w-full items-center gap-3 rounded-xl border divider px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800"><Icon name="attachment" :size="18" class="text-slate-400"/><span class="min-w-0"><span class="block truncate text-xs font-medium">{{attachment.name}}</span><span class="caption">{{sizeText(attachment.size)}}</span></span><Icon name="download" :size="15" class="text-slate-400"/></a></div><div class="mt-6 flex flex-wrap gap-2"><button class="secondary" @click="newCompose('reply',message)"><Icon name="reply" :size="16"/>回复</button><button class="secondary" @click="newCompose('replyAll',message)"><Icon name="replyAll" :size="16"/>回复全部</button><button class="secondary" @click="newCompose('forward',message)"><Icon name="forward" :size="16"/>转发</button></div></div></article></div>
           <div v-else-if="!items.length" class="flex flex-1 flex-col items-center justify-center px-6 pb-12 text-center"><span class="mb-5 flex h-20 w-20 items-center justify-center rounded-full bg-slate-50 text-slate-300 dark:bg-slate-800 dark:text-slate-600"><Icon :name="appliedQuery?'search':'inbox'" :size="34"/></span><h2 class="text-lg font-medium">{{appliedQuery?'没有找到匹配的邮件':'这里清清爽爽'}}</h2><p class="mt-3 text-sm text-slate-400">{{appliedQuery?'试试其他关键词，或使用 from:、subject: 搜索。':'当前文件夹暂无邮件。新邮件会在刷新后出现。'}}</p></div>
-          <div v-else class="flex-1 overflow-y-auto"><div v-if="appliedQuery" class="border-b divider px-6 py-3 text-xs text-slate-400">搜索结果：{{appliedQuery}}</div><div v-for="item in items" :key="item.threadId" class="group flex cursor-pointer items-center gap-3 border-b divider px-4 py-3.5 transition hover:relative hover:z-10 hover:shadow-[0_1px_4px_#00000016] sm:gap-4 sm:px-5" :class="selected.includes(item.id)?'bg-blue-50 dark:bg-blue-900/30':item.labels.includes('UNREAD')?'bg-white dark:bg-[#1e2939]':'bg-[#f8faff] dark:bg-[#17202c]'" @click="openMail(item)"><input v-model="selected" type="checkbox" :value="item.id" :aria-label="'选择 '+item.subject" class="h-4 w-4 shrink-0 accent-blue-600" @click.stop/><button class="shrink-0 text-slate-300" :aria-label="'切换星标 '+item.subject" @click.stop="star(item)"><Icon name="star" :size="18" :class="item.labels.includes('STARRED')?'fill-amber-400 text-amber-400':''"/></button><button class="flex min-w-0 flex-1 flex-col gap-1 text-left md:flex-row md:items-center md:gap-6" @click.stop="openMail(item)"><span class="w-full shrink-0 truncate text-sm md:w-40" :class="item.labels.includes('UNREAD')?'font-semibold':''">{{senderName(item.from)}} <span v-if="(item.count||0)>1" class="text-xs text-slate-400">{{item.count}}</span></span><span class="min-w-0 truncate text-sm"><span :class="item.labels.includes('UNREAD')?'font-semibold':''">{{item.subject}}</span><span v-if="item.snippet" class="ml-2 text-slate-400">— {{item.snippet}}</span></span></button><span class="shrink-0 text-xs" :class="item.labels.includes('UNREAD')?'font-semibold text-slate-600 dark:text-slate-200':'text-slate-400'">{{shortDate(item.date)}}</span></div><div class="px-5 py-8 text-center text-[11px] text-slate-400">{{activeAccount?.email}} · 每 60 秒自动检查更新</div></div>
+          <div v-else class="flex-1 overflow-y-auto"><div v-if="appliedQuery" class="border-b divider px-6 py-3 text-xs text-slate-400">搜索结果：{{appliedQuery}}</div><div v-for="item in items" :key="item.threadId" class="group flex cursor-pointer items-center gap-3 border-b divider px-4 py-3.5 transition hover:relative hover:z-10 hover:shadow-[0_1px_4px_#00000016] sm:gap-4 sm:px-5" :class="selected.includes(item.id)?'bg-blue-50 dark:bg-blue-900/30':item.labels.includes('UNREAD')?'bg-white dark:bg-[#1e2939]':'bg-[#f8faff] dark:bg-[#17202c]'" @click="openMail(item)"><input v-model="selected" type="checkbox" :value="item.id" :aria-label="'选择 '+item.subject" class="h-4 w-4 shrink-0 accent-blue-600" @click.stop/><button class="shrink-0 text-slate-300" :aria-label="'切换星标 '+item.subject" @click.stop="star(item)"><Icon name="star" :size="18" :class="item.labels.includes('STARRED')?'fill-amber-400 text-amber-400':''"/></button><button class="flex min-w-0 flex-1 flex-col gap-1 text-left md:flex-row md:items-center md:gap-6" @click.stop="openMail(item)"><span class="w-full shrink-0 truncate text-sm md:w-40" :class="item.labels.includes('UNREAD')?'font-semibold':''">{{senderName(item.from)}} <span v-if="(item.count||0)>1" class="text-xs text-slate-400">{{item.count}}</span></span><span class="min-w-0 truncate text-sm"><span :class="item.labels.includes('UNREAD')?'font-semibold':''">{{item.subject}}</span><span v-if="item.snippet" class="ml-2 text-slate-400">— {{item.snippet}}</span></span></button><span class="shrink-0 text-xs" :class="item.labels.includes('UNREAD')?'font-semibold text-slate-600 dark:text-slate-200':'text-slate-400'">{{shortDate(item.date)}}</span></div><div class="px-5 py-8 text-center text-[11px] text-slate-400">{{activeAccount?.email}}</div></div>
         </template>
       </main>
     </div>

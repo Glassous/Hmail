@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none">
+  <title>FiaGmail · 折翼信封</title>
+  <defs>
+    <linearGradient id="background" x1="4" y1="4" x2="60" y2="64" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FCE8FF"/>
+      <stop offset="0.5" stop-color="#EDE8FF"/>
+      <stop offset="1" stop-color="#D6FAF5"/>
+    </linearGradient>
+    <linearGradient id="envelope" x1="12" y1="24" x2="48" y2="51" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A15CFF"/>
+      <stop offset="1" stop-color="#5268FF"/>
+    </linearGradient>
+    <linearGradient id="coral" x1="12" y1="17" x2="32" y2="39" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FF9562"/>
+      <stop offset="1" stop-color="#FF3E91"/>
+    </linearGradient>
+    <linearGradient id="mint" x1="55" y1="12" x2="32" y2="39" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#41EAAF"/>
+      <stop offset="1" stop-color="#00BBD0"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="18" fill="url(#background)"/>
+  <path d="M12 22L32 37L52 22V45C52 48.314 49.314 51 46 51H18C14.686 51 12 48.314 12 45V22Z" fill="url(#envelope)"/>
+  <path d="M12 19C12 16.791 14.526 15.535 16.287 16.87L32 28.8V39L12 24V19Z" fill="url(#coral)"/>
+  <path d="M32 28.8L55 12L51 26L32 39V28.8Z" fill="url(#mint)"/>
+</svg>

@@ -39,7 +39,7 @@ class User(Base):
     question: Mapped[str] = mapped_column(String(200))
     answer_hash: Mapped[str] = mapped_column(Text)
     session_version: Mapped[int] = mapped_column(Integer, default=1)
-    theme: Mapped[str] = mapped_column(String(10), default='light')
+    theme: Mapped[str] = mapped_column(String(10), default='system')
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 

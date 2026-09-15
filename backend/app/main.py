@@ -1,18 +1,21 @@
 import hashlib
 import html
+import ipaddress
 import json
 import logging
 import os
 import secrets
 import smtplib
+import socket
 import imaplib
 import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
-from urllib.parse import quote as urlquote
+from urllib.parse import quote as urlquote, unquote as urlunquote, urlparse
 
+import httpx
 from fastapi import FastAPI, Request, Response, Depends, UploadFile, File
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
 from fastapi.exceptions import RequestValidationError
@@ -25,7 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from .core import *
-from .mail import MailError, MAX_ATTACHMENT, build_message, recipients, safe_html
+from .mail import MailError, MAX_ATTACHMENT, build_message, recipients, safe_html, sign_url, verify_url_sig, b64, unb64
 from .providers import GmailApiProvider, GmailImapSmtpProvider
 
 app = FastAPI(title='FiaGmail API', version='1.0.0', docs_url=None, redoc_url=None, openapi_url='/api/openapi.json')
@@ -238,7 +241,7 @@ def me(request: Request, user=Depends(current_user)):
 
 
 class Preferences(BaseModel):
-    theme: Literal['light', 'dark']
+    theme: Literal['light', 'dark', 'system']
 
 
 @app.patch(PREFIX + '/me')
@@ -459,23 +462,183 @@ def threads(aid: str, folder: str = 'INBOX', q: str = '', cursor: str = '', user
     return cached_call(user, aid, json.dumps(['list', folder, q, cursor]), 60, lambda p: p.list(folder, q, cursor))
 
 
+def check_ip_ssrf(ip_str: str):
+    ip = ipaddress.ip_address(ip_str)
+    if (ip.is_private or ip.is_loopback or ip.is_link_local 
+        or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+        raise MailError('禁止访问内网或受限 IP 地址', 'ssrf_blocked', 403)
+
+
+def validate_proxy_target_url(raw_url: str) -> tuple[str, str, int]:
+    target = raw_url.strip()
+    if target.startswith('//'):
+        target = 'https:' + target
+    parsed = urlparse(target)
+    if parsed.scheme not in ('http', 'https'):
+        raise MailError('不支持的图片协议', 'invalid_url', 400)
+    hostname = parsed.hostname
+    if not hostname:
+        raise MailError('缺少图片主机名', 'invalid_url', 400)
+    clean_host = hostname.lower().strip('.')
+    if clean_host in ('localhost', '127.0.0.1', '::1', '0.0.0.0', 'host.docker.internal'):
+        raise MailError('禁止访问本地主机', 'ssrf_blocked', 403)
+    if any(clean_host.endswith(suf) for suf in ('.local', '.internal', '.lan', '.home', '.corp', '.onion')):
+        raise MailError('禁止访问局域网域名', 'ssrf_blocked', 403)
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    if port not in (80, 443, 8080, 8443):
+        raise MailError('不支持的图片端口', 'ssrf_blocked', 403)
+    try:
+        addr_info = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise MailError('图片域名解析失败', 'dns_error', 502)
+    for *_, sockaddr in addr_info:
+        check_ip_ssrf(sockaddr[0])
+    return target, hostname, port
+
+
+@app.get(PREFIX + '/proxy/image')
+async def proxy_image(url: str, sig: str = '', request: Request = None):
+    if not url:
+        raise MailError('缺少 url 参数', 'validation', 422)
+
+    # 1. Signature or session auth
+    has_valid_sig = verify_url_sig(url, sig)
+    if not has_valid_sig:
+        sid = request.cookies.get('fia_session', '') if request else ''
+        session_val = cache.get('session:' + sid) if sid else None
+        if not session_val:
+            raise MailError('未授权访问图片代理', 'unauthorized', 401)
+
+    # 2. SSRF check
+    target_url, _, _ = validate_proxy_target_url(url)
+
+    # 3. Redis cache lookup
+    cache_key = 'imgproxy:' + hashlib.sha256(target_url.encode('utf-8')).hexdigest()
+    try:
+        cached = cache.get(cache_key)
+        if cached:
+            cached_data = json.loads(cached)
+            return Response(
+                content=unb64(cached_data['data']),
+                media_type=cached_data['type'],
+                headers={
+                    'Cache-Control': 'public, max-age=86400, immutable',
+                    'X-Content-Type-Options': 'nosniff',
+                    'Content-Security-Policy': "default-src 'none'",
+                }
+            )
+    except Exception:
+        pass
+
+    # 4. Fetch image securely
+    current_url = target_url
+    client_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+    }
+    final_resp = None
+
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=False, verify=True) as client:
+        for _ in range(4):
+            try:
+                resp = await client.get(current_url, headers=client_headers)
+            except (httpx.RequestError, httpx.TimeoutException) as exc:
+                raise MailError(f'获取远程图片失败: {exc}', 'fetch_failed', 502)
+
+            if resp.is_redirect:
+                loc = resp.headers.get('location')
+                if not loc:
+                    raise MailError('重定向缺少 Location', 'fetch_failed', 502)
+                resolved_loc = str(httpx.URL(current_url).join(loc))
+                target_url_red, _, _ = validate_proxy_target_url(resolved_loc)
+                current_url = target_url_red
+                continue
+
+            final_resp = resp
+            break
+
+    if not final_resp or final_resp.status_code != 200:
+        status_code = final_resp.status_code if final_resp else 502
+        raise MailError(f'远程图片返回状态异常 ({status_code})', 'fetch_failed', status_code if status_code in (404, 403) else 502)
+
+    content = final_resp.content
+    if len(content) > 15 * 1024 * 1024:
+        raise MailError('图片超出大小限制 (最大 15MB)', 'payload_too_large', 413)
+
+    raw_ct = final_resp.headers.get('content-type', '').split(';')[0].strip().lower()
+    if raw_ct.startswith('image/'):
+        content_type = raw_ct
+    elif content.startswith(b'\x89PNG\r\n\x1a\n'):
+        content_type = 'image/png'
+    elif content.startswith(b'\xff\xd8\xff'):
+        content_type = 'image/jpeg'
+    elif content.startswith(b'GIF8'):
+        content_type = 'image/gif'
+    elif content.startswith(b'RIFF') and len(content) > 12 and content[8:12] == b'WEBP':
+        content_type = 'image/webp'
+    elif b'<svg' in content[:512].lower():
+        content_type = 'image/svg+xml'
+    else:
+        content_type = raw_ct or 'image/jpeg'
+
+    if len(content) <= 2 * 1024 * 1024:
+        try:
+            cache.setex(cache_key, 86400, json.dumps({'type': content_type, 'data': b64(content)}))
+        except Exception:
+            pass
+
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={
+            'Cache-Control': 'public, max-age=86400, immutable',
+            'X-Content-Type-Options': 'nosniff',
+            'Content-Security-Policy': "default-src 'none'",
+        }
+    )
+
+
 @app.get(PREFIX + '/gmail-accounts/{aid}/threads/{tid}')
-def thread(aid: str, tid: str, user=Depends(current_user)):
+def thread(aid: str, tid: str, remote: bool = True, user=Depends(current_user)):
     result = cached_call(user, aid, 'thread:' + tid, 300, lambda p: p.thread(tid))
-    return [{**m, 'html': safe_html(m['html']) if m['html'] else ''} for m in result]
+    return [{**m, 'html': safe_html(m['html'], remote=remote, aid=aid, mid=m['id'], attachments=m.get('attachments')) if m.get('html') else ''} for m in result]
 
 
 @app.get(PREFIX + '/gmail-accounts/{aid}/messages/{mid}')
-def message(aid: str, mid: str, remote: bool = False, user=Depends(current_user)):
+def message(aid: str, mid: str, remote: bool = True, user=Depends(current_user)):
     result = cached_call(user, aid, 'message:' + mid, 300, lambda p: p.message(mid))
-    return {**result, 'html': safe_html(result['html'], remote) if result['html'] else ''}
+    return {**result, 'html': safe_html(result['html'], remote=remote, aid=aid, mid=mid, attachments=result.get('attachments')) if result.get('html') else ''}
 
 
 @app.get(PREFIX + '/gmail-accounts/{aid}/messages/{mid}/attachments/{part}')
-def attachment(aid: str, mid: str, part: str, user=Depends(current_user)):
+def attachment(aid: str, mid: str, part: str, request: Request, sig: str = ''):
+    has_valid_sig = verify_url_sig(f'{aid}:{mid}:{part}', sig)
+    if not has_valid_sig:
+        user = current_user(request)
+    else:
+        with Session() as db:
+            acc = db.get(Account, aid)
+            if not acc:
+                raise MailError('邮箱账户不存在', 'not_found', 404)
+            user = db.get(User, acc.user_id)
+            if not user:
+                raise MailError('用户不存在', 'not_found', 404)
+
     with provider_for(user, aid) as (provider, _):
         content, name, content_type = provider.attachment(mid, part)
-    return Response(content, media_type='application/octet-stream', headers={'Content-Disposition': "attachment; filename*=UTF-8''" + urlquote(name, safe='')})
+
+    media_type = content_type or 'application/octet-stream'
+    is_image = media_type.startswith('image/')
+    disposition = 'inline' if is_image else 'attachment'
+    return Response(
+        content,
+        media_type=media_type,
+        headers={
+            'Content-Disposition': f"{disposition}; filename*=UTF-8''" + urlquote(name, safe=''),
+            'Cache-Control': 'private, max-age=86400',
+            'X-Content-Type-Options': 'nosniff',
+        }
+    )
 
 
 @app.get(PREFIX + '/gmail-accounts/{aid}/labels')

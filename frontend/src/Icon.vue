@@ -10,7 +10,7 @@ const paths: Record<string, string> = {
   refresh: 'M20 7V3l-3 3a8 8 0 1 0 3 11M20 7h-5', chevron: 'm9 5 7 7-7 7', back: 'm14 6-6 6 6 6M8 12h13',
   close: 'm6 6 12 12M6 18 18 6', plus: 'M12 5v14M5 12h14', settings: 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8M4 4l16 16M4 20 20 4M12 2v4M12 18v4M2 12h4M18 12h4',
   sun: 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1 1M18 18l1 1M5 19l1-1M18 6l1-1',
-  moon: 'M21 13a9 9 0 0 1-10-10A9 9 0 1 0 21 13Z', attachment: 'm8 12 6-6a3 3 0 0 1 4 4l-8 8a5 5 0 0 1-7-7l8-8',
+  moon: 'M21 13a9 9 0 0 1-10-10A9 9 0 1 0 21 13Z', system: 'M20 3H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2ZM8 21h8M12 17v4', attachment: 'm8 12 6-6a3 3 0 0 1 4 4l-8 8a5 5 0 0 1-7-7l8-8',
   logout: 'M9 4H3v16h6M14 7l5 5-5 5M8 12h13', shield: 'm12 2 9 4v6c0 5-9 10-9 10S3 17 3 12V6l9-4ZM8 12l3 3 5-6',
   alert: 'm12 3 10 18H2L12 3ZM12 9v5M12 17h.01', check: 'm5 12 4 4L19 6', reply: 'm9 5-7 7 7 7M2 12h12a7 7 0 0 1 7 7',
   replyAll: 'm8 5-6 7 6 7M13 5l-6 7 6 7M7 12h9a5 5 0 0 1 5 5', forward: 'm15 5 7 7-7 7M22 12H8a5 5 0 0 0-5 5',

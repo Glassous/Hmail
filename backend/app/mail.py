@@ -1,15 +1,31 @@
 import base64
+import hashlib
+import hmac
 import html
 import mimetypes
+import os
 import re
+import secrets
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import getaddresses, make_msgid
+from urllib.parse import quote as urlquote
 
 import nh3
 
 MAX_ATTACHMENT = 18 * 1024 * 1024
+SIGN_KEY = os.environ.get('TOKEN_ENCRYPTION_KEY', 'fiagmail-token-key-default').encode()
+
+
+def sign_url(value: str) -> str:
+    return hmac.new(SIGN_KEY, value.encode('utf-8'), hashlib.sha256).hexdigest()[:32]
+
+
+def verify_url_sig(value: str, sig: str) -> bool:
+    if not sig or not value:
+        return False
+    return secrets.compare_digest(sign_url(value), sig)
 
 
 class MailError(Exception):
@@ -26,15 +42,134 @@ def unb64(value):
     return base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
 
 
-def safe_html(value, remote=False):
-    tags = {'p', 'div', 'span', 'br', 'hr', 'strong', 'b', 'em', 'i', 'u', 's', 'blockquote', 'pre', 'code', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tr', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'a'}
-    attrs = {'a': {'href', 'title'}, 'td': {'colspan', 'rowspan'}, 'th': {'colspan', 'rowspan'}}
+def safe_html(value, remote=True, aid='', mid='', attachments=None):
+    if not value:
+        return ''
+
+    # 1. Map CID inline images to backend attachment URLs with HMAC signature
+    cid_map = {}
+    if aid and mid and attachments:
+        for att in attachments:
+            cid = str(att.get('cid') or '').strip('<>').strip()
+            if cid:
+                att_part = att['id']
+                att_sig = sign_url(f'{aid}:{mid}:{att_part}')
+                att_url = f"/api/v1/gmail-accounts/{aid}/messages/{mid}/attachments/{att_part}?sig={att_sig}"
+                cid_map[cid] = att_url
+                cid_map[cid.lower()] = att_url
+
+    if cid_map:
+        value = re.sub(
+            r'''(?i)\b(src|background)=["']?cid:([^"'\s>]+)["']?''',
+            lambda m: f'{m.group(1)}="{cid_map.get(m.group(2).strip("<>"), cid_map.get(m.group(2).strip("<>").lower(), m.group(0)))}"',
+            value
+        )
+        value = re.sub(
+            r'''(?i)url\(\s*['"]?cid:([^"')\s]+)['"]?\s*\)''',
+            lambda m: f'url("{cid_map.get(m.group(1).strip("<>"), cid_map.get(m.group(1).strip("<>").lower(), m.group(0)))}")',
+            value
+        )
+
+    # 2. Extract and sanitize style blocks
+    style_blocks = re.findall(r'<style\b[^>]*>(.*?)</style>', value, flags=re.DOTALL | re.IGNORECASE)
+    clean_styles = []
+    for s in style_blocks:
+        s = re.sub(r'(?i)expression\s*\(.*?\)', '', s)
+        s = re.sub(r'(?i)javascript:', '', s)
+        s = re.sub(r'(?i)@import\b[^;]*;', '', s)
+        if not remote:
+            s = re.sub(r'(?i)url\s*\(\s*[\'"]?https?:[^\)]*\)', 'none', s)
+        else:
+            def proxy_style_url(m):
+                raw = html.unescape(m.group(1).strip('\'" \t'))
+                if raw.startswith('//'):
+                    raw = 'https:' + raw
+                if raw.startswith(('http://', 'https://')):
+                    sig = sign_url(raw)
+                    return f"url('/api/v1/proxy/image?url={urlquote(raw, safe='')}&sig={sig}')"
+                return m.group(0)
+            s = re.sub(r'''(?i)url\(\s*['"]?((?:https?:|//)[^"')\s]+)['"]?\s*\)''', proxy_style_url, s)
+        clean_styles.append(s)
+
+    tags = set(nh3.ALLOWED_TAGS) | {'center', 'font'}
+    attrs = {
+        '*': {'style', 'class', 'id', 'dir', 'align', 'valign', 'bgcolor', 'color', 'width', 'height', 'title', 'lang'},
+        'a': {'href', 'title', 'target'},
+        'td': {'colspan', 'rowspan', 'headers', 'width', 'height', 'align', 'valign', 'bgcolor', 'style', 'class'},
+        'th': {'colspan', 'rowspan', 'headers', 'width', 'height', 'align', 'valign', 'bgcolor', 'style', 'class'},
+        'table': {'width', 'height', 'align', 'valign', 'bgcolor', 'border', 'cellpadding', 'cellspacing', 'style', 'class'},
+        'img': {'src', 'alt', 'width', 'height', 'title', 'border', 'align', 'style', 'class', 'loading', 'srcset'},
+        'font': {'color', 'size', 'face'},
+    }
+    clean = nh3.clean(value, tags=tags, attributes=attrs, url_schemes={'https', 'http', 'mailto', 'cid', 'data'}, strip_comments=True)
+
+    # 3. Rewrite external image URLs to backend proxy
+    def to_proxy_url(raw_url):
+        raw = html.unescape(raw_url.strip())
+        if raw.startswith('//'):
+            raw = 'https:' + raw
+        if raw.startswith(('http://', 'https://')):
+            sig = sign_url(raw)
+            return f"/api/v1/proxy/image?url={urlquote(raw, safe='')}&sig={sig}"
+        return raw
+
     if remote:
-        tags.add('img')
-        attrs['img'] = {'src', 'alt', 'width', 'height'}
-    clean = nh3.clean(value, tags=tags, attributes=attrs, url_schemes={'https', 'http', 'mailto'}, strip_comments=True)
-    csp = "default-src 'none'; style-src 'unsafe-inline'; img-src https: http:" if remote else "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'"
-    return '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + csp + '"><meta name="referrer" content="no-referrer"><style>body{font:14px/1.7 system-ui;color:#263238;overflow-wrap:anywhere;margin:16px}img{max-width:100%;height:auto}table{max-width:100%}pre{white-space:pre-wrap}a{color:#1967d2}</style></head><body>' + clean + '</body></html>'
+        clean = re.sub(
+            r'''(?i)\b(src|background)=["']([^"']+)["']''',
+            lambda m: f'{m.group(1)}="{to_proxy_url(m.group(2))}"' if m.group(2).startswith(('http://', 'https://', '//')) else m.group(0),
+            clean
+        )
+        clean = re.sub(
+            r'''(?i)url\(\s*['"]?((?:https?:|//)[^"')\s]+)['"]?\s*\)''',
+            lambda u: f"url('{to_proxy_url(u.group(1))}')",
+            clean
+        )
+
+        def rewrite_srcset(m):
+            parts = m.group(1).split(',')
+            new_parts = []
+            for p in parts:
+                p_strip = p.strip()
+                if not p_strip:
+                    continue
+                tokens = p_strip.split()
+                if tokens and tokens[0].startswith(('http://', 'https://', '//')):
+                    tokens[0] = to_proxy_url(tokens[0])
+                new_parts.append(' '.join(tokens))
+            return f'srcset="{", ".join(new_parts)}"'
+        clean = re.sub(r'''(?i)\bsrcset=["']([^"']+)["']''', rewrite_srcset, clean)
+    else:
+        clean = re.sub(
+            r'''(?i)\b(src)=["'](?:https?:|//)[^"']+["']''',
+            r'\1="data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'1\' height=\'1\'%3E%3C/svg%3E"',
+            clean
+        )
+        clean = re.sub(
+            r'''(?i)url\(\s*['"]?(?:https?:|//)[^"')\s]+['"]?\s*\)''',
+            'none',
+            clean
+        )
+
+    # 4. Enforce strict CSP in iframe: ONLY 'self' and data: allowed
+    csp = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; font-src data:;"
+    styles_markup = ''.join(f'<style>{s}</style>' for s in clean_styles)
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        f'<meta http-equiv="Content-Security-Policy" content="{csp}">'
+        '<meta name="referrer" content="no-referrer">'
+        '<base target="_blank">'
+        '<style>'
+        'body{font:14px/1.7 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#263238;overflow-wrap:anywhere;margin:16px;word-break:break-word}'
+        'img{max-width:100%;height:auto}'
+        'table{max-width:100%}'
+        'pre{white-space:pre-wrap;word-break:break-all}'
+        'a{color:#1967d2;text-decoration:underline}'
+        '</style>'
+        f'{styles_markup}'
+        '</head><body>'
+        f'{clean}'
+        '</body></html>'
+    )
 
 
 def parse_message(raw, message_id, thread_id, labels=None):
