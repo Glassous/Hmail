@@ -41,6 +41,20 @@ docker compose logs --tail 100 api
 
 修改 `.env` 后执行 `docker compose up -d --force-recreate api`。若 8184 被其他服务占用，先处理冲突；不要直接停止不相关服务。
 
+## 自动部署
+
+推送到 `main` 分支后，GitHub Actions 会构建后端镜像与前端静态产物，再通过 SSH 发布到服务器：后端与 Compose 编排位于 `/opt/hmail`，前端页面位于 1Panel 站点目录。服务器不执行构建。
+
+```text
+.github/workflows/deploy.yml   CI：构建镜像推送 GHCR、构建前端产物、SSH 同步发布
+compose.prod.yaml              生产编排：以 GHCR 镜像运行，无源码挂载
+scripts/deploy-remote.sh       服务器端发布脚本：pull、up、健康检查
+.env.production.example        服务器 .env 模板
+docs/GITHUB-DEPLOY.md          完整部署指南（Secrets、服务器准备、反向代理配置）
+```
+
+所需 Secrets 为 `SERVER_HOST`、`SERVER_USER`、`SERVER_SSH_KEY`，SSH 端口固定 22。首次部署前请按 [GitHub Actions 自动部署指南](docs/GITHUB-DEPLOY.md) 完成服务器目录、`.env` 与反向代理配置。
+
 ## 账户使用
 
 - 注册：邮箱地址、密码（10–128 字符）和邮箱验证码。注册前点击“获取验证码”，验证码 10 分钟内有效且仅可使用一次，错误尝试超过 5 次即失效。

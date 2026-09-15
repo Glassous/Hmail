@@ -1,0 +1,143 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_SUFFIX: hmail-backend
+  DEPLOY_DIR: /opt/hmail
+  WEB_ROOT: /opt/1panel/www/sites/hmail.fiacloud.top/index/dist
+  SSH_PORT: "22"
+
+jobs:
+  build:
+    name: 构建镜像与前端产物
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 计算镜像地址（小写）
+        id: image
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_SUFFIX }}"
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          echo "name=$IMAGE:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "base=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送后端镜像（服务器不构建）
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          build-args: |
+            PIP_INDEX_URL=${{ vars.PIP_INDEX_URL || 'https://pypi.org/simple' }}
+          tags: |
+            ${{ steps.image.outputs.name }}
+            ${{ steps.image.outputs.base }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 构建前端静态产物
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 3
+
+  deploy:
+    name: 发布到服务器
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist
+
+      - name: 配置 SSH 私钥
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "${{ env.SSH_PORT }}" -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          echo "ServerAliveInterval 30" >> ~/.ssh/config
+
+      - name: 准备服务器目录
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          ssh -p "${{ env.SSH_PORT }}" "$SERVER_USER@$SERVER_HOST" \
+            "sudo mkdir -p '${{ env.DEPLOY_DIR }}' '${{ env.WEB_ROOT }}' && \
+             sudo chown -R \$USER '${{ env.DEPLOY_DIR }}' '${{ env.WEB_ROOT }}' && \
+             sudo chmod -R a+rX '${{ env.WEB_ROOT }}'"
+
+      - name: 同步编排文件与发布脚本
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          rsync -e "ssh -p ${{ env.SSH_PORT }}" -a --chmod=D755,F644 \
+            compose.prod.yaml "$SERVER_USER@$SERVER_HOST:${{ env.DEPLOY_DIR }}/compose.yaml"
+          rsync -e "ssh -p ${{ env.SSH_PORT }}" -a --chmod=D755,F644 \
+            .env.production.example "$SERVER_USER@$SERVER_HOST:${{ env.DEPLOY_DIR }}/.env.example"
+          rsync -e "ssh -p ${{ env.SSH_PORT }}" -a --chmod=D755,F755 \
+            scripts/deploy-remote.sh "$SERVER_USER@$SERVER_HOST:${{ env.DEPLOY_DIR }}/deploy-remote.sh"
+
+      - name: 发布前端静态产物
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          rsync -e "ssh -p ${{ env.SSH_PORT }}" -a --delete --chmod=D755,F644 \
+            frontend-dist/ "$SERVER_USER@$SERVER_HOST:${{ env.WEB_ROOT }}/"
+
+      - name: 登录 GHCR 并发布后端
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | ssh -p "${{ env.SSH_PORT }}" "$SERVER_USER@$SERVER_HOST" \
+            "sudo docker login ${{ env.REGISTRY }} -u '${{ github.actor }}' --password-stdin && \
+             cd '${{ env.DEPLOY_DIR }}' && bash ./deploy-remote.sh"
