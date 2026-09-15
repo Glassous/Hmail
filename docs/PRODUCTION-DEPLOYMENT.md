@@ -1,6 +1,6 @@
-# FiaGmail 正式部署与 Google OAuth 发布指南
+# Hmail 正式部署与 Google OAuth 发布指南
 
-本文说明如何将 FiaGmail 从本地测试环境迁移到公网生产环境，并把 Google OAuth 应用从“测试中”推进为可供外部用户使用的正式应用。
+本文说明如何将 Hmail 从本地测试环境迁移到公网生产环境，并把 Google OAuth 应用从“测试中”推进为可供外部用户使用的正式应用。
 
 > 当前项目定位仍是本地原型。正式发布前需要完成本文“上线前必须补充的能力”，并根据所在地法律和实际数据处理方式审阅隐私政策及服务条款。
 
@@ -138,7 +138,7 @@ docker compose ps
 
 不要直接把本地测试项目当作长期生产项目。推荐流程：
 
-1. 创建 `FiaGmail Production` Google Cloud 项目。
+1. 创建 `Hmail Production` Google Cloud 项目。
 2. 为项目配置长期有效的 Owner、Editor 和联系邮箱。
 3. 启用 Gmail API。
 4. 在 Google Auth Platform 中将用户类型设置为“外部”。
@@ -176,7 +176,7 @@ https://mail.example.com/support
 
 首页不能只有登录表单，应清楚展示：
 
-- FiaGmail 的开发者或运营主体。
+- Hmail 的开发者或运营主体。
 - 应用用于连接、阅读、发送和整理 Gmail 邮件。
 - 用户能获得的实际功能。
 - 隐私政策、服务条款和支持页面链接。
@@ -206,7 +206,7 @@ https://mail.example.com/support
 
 在生产项目的 Google Auth Platform 中填写：
 
-- 应用名称：FiaGmail。
+- 应用名称：Hmail。
 - 用户类型：外部。
 - 应用首页。
 - 隐私政策地址。
@@ -255,11 +255,11 @@ https://www.googleapis.com/auth/gmail.modify
 
 建议录制连续、清晰且可识别域名的视频，演示：
 
-1. 打开 FiaGmail 公网首页及隐私政策。
+1. 打开 Hmail 公网首页及隐私政策。
 2. 注册或登录平台账户。
 3. 点击“使用 Google 连接”。
 4. 展示 OAuth 同意页面中的应用名称和申请权限。
-5. 完成授权并返回 FiaGmail。
+5. 完成授权并返回 Hmail。
 6. 阅读邮件、搜索、修改标签或归档邮件。
 7. 创建草稿并发送测试邮件。
 8. 断开 Gmail 连接。

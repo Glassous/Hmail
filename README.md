@@ -1,4 +1,4 @@
-# FiaGmail
+# Hmail
 
 本地运行的 Gmail Web 客户端：Vue 3 / Vite / TypeScript / Tailwind CSS + FastAPI + PostgreSQL + Redis。界面自行实现，不使用 UI 组件库或图标库。
 

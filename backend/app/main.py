@@ -31,10 +31,10 @@ from .core import *
 from .mail import MailError, MAX_ATTACHMENT, build_message, recipients, safe_html, sign_url, verify_url_sig, b64, unb64
 from .providers import GmailApiProvider, GmailImapSmtpProvider
 
-app = FastAPI(title='FiaGmail API', version='1.0.0', docs_url=None, redoc_url=None, openapi_url='/api/openapi.json')
+app = FastAPI(title='Hmail API', version='1.0.0', docs_url=None, redoc_url=None, openapi_url='/api/openapi.json')
 logging.basicConfig(level=logging.INFO, format='%(message)s')
-log = logging.getLogger('fiagmail')
-UPLOAD_DIR = Path(tempfile.gettempdir()) / 'fiagmail-uploads'
+log = logging.getLogger('hmail')
+UPLOAD_DIR = Path(tempfile.gettempdir()) / 'hmail-uploads'
 UPLOAD_DIR.mkdir(mode=0o700, exist_ok=True)
 PREFIX = '/api/v1'
 DUMMY_HASH = passwords.hash('not-a-real-account-password')
@@ -88,7 +88,7 @@ def limited(request, action, identity='', maximum=8, seconds=900):
 
 
 def current_user(request: Request):
-    sid = request.cookies.get('fia_session', '')
+    sid = request.cookies.get('hmail_session', '')
     value = cache.get('session:' + sid) if sid else None
     if not value:
         raise MailError('请先登录', 'unauthorized', 401)
@@ -112,7 +112,7 @@ def make_session(user, response, old=''):
         cache.delete('session:' + old)
     sid, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
     cache.setex('session:' + sid, 86400 * 7, json.dumps({'user': user.id, 'version': user.session_version, 'csrf': csrf}))
-    response.set_cookie('fia_session', sid, max_age=86400 * 7, httponly=True, secure=PUBLIC_URL.startswith('https:'), samesite='lax', path='/')
+    response.set_cookie('hmail_session', sid, max_age=86400 * 7, httponly=True, secure=PUBLIC_URL.startswith('https:'), samesite='lax', path='/')
     return {'user': public_user(user), 'csrf': csrf}
 
 
@@ -157,7 +157,7 @@ def api_docs():
         for method, spec in methods.items():
             sections.append('<details><summary><b>' + html.escape(method.upper()) + '</b> ' + html.escape(path) + '</summary><pre>' + html.escape(json.dumps(spec, ensure_ascii=False, indent=2)) + '</pre></details>')
     models = html.escape(json.dumps(schema.get('components', {}), ensure_ascii=False, indent=2))
-    return '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FiaGmail API</title><style>body{max-width:1050px;margin:40px auto;padding:0 24px;font:14px/1.8 system-ui;color:#263238}a,b{color:#2563eb}details{border:1px solid #e2e8f0;border-radius:10px;padding:12px;margin:10px 0}summary{cursor:pointer}pre{overflow:auto;background:#f8fafc;padding:16px;font-size:12px}</style><h1>FiaGmail API</h1><p>本地接口参考 · <a href="/api/openapi.json">下载 OpenAPI JSON</a> · <a href="/">返回邮箱</a></p><p>写请求要求同源 Origin；已登录写请求还需会话 Cookie 和 X-CSRF-Token。点击接口查看参数及返回结构。</p>' + ''.join(sections) + '<details><summary>数据模型 Schemas</summary><pre>' + models + '</pre></details></html>'
+    return '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hmail API</title><style>body{max-width:1050px;margin:40px auto;padding:0 24px;font:14px/1.8 system-ui;color:#263238}a,b{color:#2563eb}details{border:1px solid #e2e8f0;border-radius:10px;padding:12px;margin:10px 0}summary{cursor:pointer}pre{overflow:auto;background:#f8fafc;padding:16px;font-size:12px}</style><h1>Hmail API</h1><p>本地接口参考 · <a href="/api/openapi.json">下载 OpenAPI JSON</a> · <a href="/">返回邮箱</a></p><p>写请求要求同源 Origin；已登录写请求还需会话 Cookie 和 X-CSRF-Token。点击接口查看参数及返回结构。</p>' + ''.join(sections) + '<details><summary>数据模型 Schemas</summary><pre>' + models + '</pre></details></html>'
 
 
 @app.get(PREFIX + '/config')
@@ -177,7 +177,7 @@ def register(data: Register, request: Request, response: Response):
             db.commit()
         except IntegrityError:
             raise MailError('用户名已被使用', 'conflict', 409) from None
-    return make_session(user, response, request.cookies.get('fia_session'))
+    return make_session(user, response, request.cookies.get('hmail_session'))
 
 
 @app.post(PREFIX + '/auth/login')
@@ -187,13 +187,13 @@ def login(data: Login, request: Request, response: Response):
         user = db.scalar(select(User).where(User.username == data.username))
     if not verify(data.password, user.password_hash if user else DUMMY_HASH) or not user:
         raise MailError('用户名或密码不正确', 'credentials', 401)
-    return make_session(user, response, request.cookies.get('fia_session'))
+    return make_session(user, response, request.cookies.get('hmail_session'))
 
 
 @app.post(PREFIX + '/auth/logout')
 def logout(request: Request, response: Response, user=Depends(current_user)):
-    cache.delete('session:' + request.cookies['fia_session'])
-    response.delete_cookie('fia_session', path='/')
+    cache.delete('session:' + request.cookies['hmail_session'])
+    response.delete_cookie('hmail_session', path='/')
     return {'ok': True}
 
 
@@ -399,7 +399,7 @@ def oauth_start(request: Request, user=Depends(current_user)):
     state = secrets.token_urlsafe(32)
     flow = oauth_flow(state)
     url, _ = flow.authorization_url(access_type='offline', prompt='consent')
-    cache.setex('oauth:' + state, 600, json.dumps({'user': user.id, 'session': request.cookies['fia_session']}))
+    cache.setex('oauth:' + state, 600, json.dumps({'user': user.id, 'session': request.cookies['hmail_session']}))
     return {'url': url}
 
 
@@ -409,7 +409,7 @@ def oauth_callback(request: Request, state: str = '', code: str = '', error: str
     if not value:
         raise MailError('授权请求已过期，请重新连接', 'oauth_state', 400)
     value = json.loads(value)
-    if value['user'] != user.id or not secrets.compare_digest(value['session'], request.cookies.get('fia_session', '')):
+    if value['user'] != user.id or not secrets.compare_digest(value['session'], request.cookies.get('hmail_session', '')):
         raise MailError('授权请求与当前会话不匹配', 'oauth_state', 400)
     if error or not code:
         return RedirectResponse('/?connection=cancelled', status_code=303)
@@ -504,7 +504,7 @@ async def proxy_image(url: str, sig: str = '', request: Request = None):
     # 1. Signature or session auth
     has_valid_sig = verify_url_sig(url, sig)
     if not has_valid_sig:
-        sid = request.cookies.get('fia_session', '') if request else ''
+        sid = request.cookies.get('hmail_session', '') if request else ''
         session_val = cache.get('session:' + sid) if sid else None
         if not session_val:
             raise MailError('未授权访问图片代理', 'unauthorized', 401)

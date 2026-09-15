@@ -4,7 +4,7 @@
 
 ## 已完成的构建检查
 
-- 后端 Docker 镜像 `fiagmail-api:latest` 构建成功。
+- 后端 Docker 镜像 `hmail-api:latest` 构建成功。
 - 后端依赖通过清华 PyPI 镜像安装成功。
 - 前端在 Windows 本机执行 `vue-tsc -b && vite build` 成功。
 - Vite 生产构建生成 HTML、Tailwind CSS 和 JavaScript 静态资源。

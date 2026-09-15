@@ -15,7 +15,7 @@ from urllib.parse import quote as urlquote
 import nh3
 
 MAX_ATTACHMENT = 18 * 1024 * 1024
-SIGN_KEY = os.environ.get('TOKEN_ENCRYPTION_KEY', 'fiagmail-token-key-default').encode()
+SIGN_KEY = os.environ.get('TOKEN_ENCRYPTION_KEY', 'hmail-token-key-default').encode()
 
 
 def sign_url(value: str) -> str:

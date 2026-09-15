@@ -1,4 +1,4 @@
-name: fiagmail
+name: hmail
 services:
   api:
     build:
@@ -8,7 +8,7 @@ services:
     ports:
       - "127.0.0.1:8184:8000"
     environment:
-      DATABASE_URL: postgresql+psycopg://fiagmail:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db/fiagmail
+      DATABASE_URL: postgresql+psycopg://hmail:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db/hmail
       REDIS_URL: redis://redis:6379/0
       TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?Set TOKEN_ENCRYPTION_KEY}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
@@ -30,14 +30,14 @@ services:
   db:
     image: postgres:18-alpine
     environment:
-      POSTGRES_DB: fiagmail
-      POSTGRES_USER: fiagmail
+      POSTGRES_DB: hmail
+      POSTGRES_USER: hmail
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fiagmail"]
+      test: ["CMD-SHELL", "pg_isready -U hmail"]
       interval: 5s
       timeout: 5s
       retries: 10

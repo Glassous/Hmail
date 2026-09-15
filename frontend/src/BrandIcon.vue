@@ -1,6 +1,6 @@
 <script setup lang="ts">
 withDefaults(defineProps<{ size?: number }>(), { size: 36 })
-const iconUrl = new URL('./assets/fiagmail.svg', import.meta.url).href
+const iconUrl = new URL('./assets/hmail.svg', import.meta.url).href
 </script>
 
 <template>
