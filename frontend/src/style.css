@@ -1,0 +1,19 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+@theme { --font-sans: "Inter", "Segoe UI", "Microsoft YaHei", sans-serif; }
+@layer base {
+  body { @apply m-0 bg-[#f6f8fc] text-slate-800 antialiased dark:bg-[#10151e] dark:text-slate-200; }
+  button { @apply cursor-pointer disabled:cursor-not-allowed disabled:opacity-40; }
+  button, input, select, textarea, a { @apply outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900; }
+  input, select, textarea { @apply min-w-0; }
+  ::selection { @apply bg-blue-200 text-slate-900; }
+}
+@layer components {
+  .field { @apply w-full rounded-xl border border-slate-200 bg-white px-3.5 py-3 text-sm placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-800; }
+  .primary { @apply inline-flex items-center justify-center gap-2 rounded-full bg-blue-600 px-6 py-2.5 text-sm font-medium text-white transition hover:bg-blue-700; }
+  .secondary { @apply inline-flex items-center justify-center gap-2 rounded-full border border-slate-200 px-4 py-2 text-sm transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800; }
+  .icon-btn { @apply inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-200/60 dark:text-slate-400 dark:hover:bg-slate-700; }
+  .surface { @apply bg-white dark:bg-[#19212e]; }
+  .divider { @apply border-slate-100 dark:border-slate-700/70; }
+  .caption { @apply text-xs text-slate-400; }
+}
