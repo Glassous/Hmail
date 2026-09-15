@@ -454,12 +454,93 @@ def oauth_start(request: Request, user=Depends(current_user)):
     return {'url': url}
 
 
+@app.post(PREFIX + '/gmail-accounts/oauth/mobile/start')
+def mobile_oauth_start(request: Request, user=Depends(current_user)):
+    limited(request, 'mobile-oauth', user.id, 10)
+    state, ticket = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    flow = oauth_flow(state)
+    url, _ = flow.authorization_url(access_type='offline', prompt='consent')
+    record = {'user': user.id, 'session': request.cookies['hmail_session'],
+              'mobile': True, 'ticket': ticket, 'status': 'waiting'}
+    cache.setex('oauth:' + state, 600, json.dumps(record))
+    cache.setex('mobile-oauth:' + ticket, 600, json.dumps(record))
+    return {'url': url, 'ticket': ticket, 'expiresIn': 600}
+
+
+@app.get(PREFIX + '/gmail-accounts/oauth/mobile/status')
+def mobile_oauth_status(request: Request, user=Depends(current_user)):
+    ticket = request.headers.get('x-oauth-ticket', '')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{43}', ticket):
+        raise MailError('连接请求无效，请重试', 'oauth_state', 400)
+    raw = cache.get('mobile-oauth:' + ticket)
+    if not raw:
+        return {'status': 'expired'}
+    record = json.loads(raw)
+    if record['user'] != user.id or not secrets.compare_digest(record['session'], request.cookies['hmail_session']):
+        raise MailError('连接请求无效，请重试', 'oauth_state', 403)
+    return {'status': record['status']}
+
+
+def mobile_oauth_finish(record, status):
+    record['status'] = status
+    cache.setex('mobile-oauth:' + record['ticket'], 600, json.dumps(record))
+    title = {'success': '邮箱已连接', 'cancelled': '已取消连接', 'failed': '连接失败，请重试'}[status]
+    return HTMLResponse('<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+                        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                        '<title>Hmail</title><style>body{background:#f6f8fc;color:#1e293b;'
+                        'font:16px system-ui;text-align:center;padding:20vh 24px}'
+                        'h1{font-size:24px}p{color:#64748b}</style><h1>' + title +
+                        '</h1><p>返回 Hmail</p></html>', headers={
+                            'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+                            'Referrer-Policy': 'no-referrer'})
+
+
 @app.get(PREFIX + '/gmail-accounts/oauth/callback')
-def oauth_callback(request: Request, state: str = '', code: str = '', error: str = '', user=Depends(current_user)):
+def oauth_callback(request: Request, state: str = '', code: str = '', error: str = ''):
+    pending = cache.get('oauth:' + state)
+    if not pending:
+        raise MailError('授权请求已过期，请重新连接', 'oauth_state', 400)
+    # Authenticate the web session before consuming the one-time state.
+    web_user = None if json.loads(pending).get('mobile') else current_user(request)
     value = cache.getdel('oauth:' + state)
     if not value:
         raise MailError('授权请求已过期，请重新连接', 'oauth_state', 400)
     value = json.loads(value)
+    if value.get('mobile'):
+        # Browser cookies are unrelated to the native session. Bind exclusively to
+        # the single-use server-generated state and revalidate the initiating session.
+        raw_session = cache.get('session:' + value['session'])
+        session = json.loads(raw_session) if raw_session else None
+        with Session() as db:
+            user = db.get(User, value['user'])
+        if not user or not session or session.get('user') != user.id or session.get('version') != user.session_version:
+            return mobile_oauth_finish(value, 'failed')
+        if error or not code:
+            return mobile_oauth_finish(value, 'cancelled')
+        provider = None
+        try:
+            flow = oauth_flow(state)
+            flow.fetch_token(code=code)
+            secret = json.loads(flow.credentials.to_json())
+            if not secret.get('refresh_token'):
+                return mobile_oauth_finish(value, 'failed')
+            provider = GmailApiProvider('', secret)
+            email = provider.profile()['emailAddress']
+            # Password changes or logout during consent/token exchange invalidate it.
+            current = cache.get('session:' + value['session'])
+            with Session() as db:
+                latest = db.get(User, value['user'])
+            if not current or not latest or latest.session_version != session['version']:
+                return mobile_oauth_finish(value, 'failed')
+            save_account(latest, email, 'oauth', secret)
+            return mobile_oauth_finish(value, 'success')
+        except Exception:
+            log.warning('mobile_oauth_failed requestId=%s', request.state.request_id)
+            return mobile_oauth_finish(value, 'failed')
+        finally:
+            if provider:
+                provider.close()
+    user = web_user
     if value['user'] != user.id or not secrets.compare_digest(value['session'], request.cookies.get('hmail_session', '')):
         raise MailError('授权请求与当前会话不匹配', 'oauth_state', 400)
     if error or not code:
