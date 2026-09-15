@@ -16,11 +16,21 @@ fail() { printf '[deploy] 错误：%s\n' "$*" >&2; exit 1; }
 [ -d "$DEPLOY_DIR" ] || fail "编排目录 $DEPLOY_DIR 不存在"
 cd "$DEPLOY_DIR"
 [ -f "$COMPOSE_FILE" ] || fail "未找到 $DEPLOY_DIR/$COMPOSE_FILE"
-[ -f ".env" ] || fail "未找到 $DEPLOY_DIR/.env，请先按 .env.production.example 创建生产配置"
+[ -f ".env" ] || fail "未找到 $DEPLOY_DIR/.env，请先按 $DEPLOY_DIR/.env.example 创建生产配置"
+
+# .env 中的镜像地址是部署的基准：CI 推送的是 <sha> 与 latest 两个标签，这里必须与之匹配
+env_value() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" .env | tail -n 1 | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" -e 's/[[:space:]]*$//'; }
+HMAIL_IMAGE_VALUE="$(env_value HMAIL_IMAGE)"
+[ -n "$HMAIL_IMAGE_VALUE" ] || fail "在 $DEPLOY_DIR/.env 中未找到 HMAIL_IMAGE，请填写 ghcr.io/<owner>/hmail-backend:latest"
+case "$HMAIL_IMAGE_VALUE" in
+  *[A-Z]*) fail "HMAIL_IMAGE 含大写字母（$HMAIL_IMAGE_VALUE），GHCR 要求全小写" ;;
+  *:*) ;;
+  *) fail "HMAIL_IMAGE（$HMAIL_IMAGE_VALUE）缺少标签，应形如 ghcr.io/<owner>/hmail-backend:latest" ;;
+esac
 
 dc() { sudo docker compose -f "$COMPOSE_FILE" "$@"; }
 
-if [ -f "$HOME/.docker/config.json" ] || [ -f /root/.docker/config.json ]; then
+if sudo test -s /root/.docker/config.json || [ -s "$HOME/.docker/config.json" ]; then
   log "检测到 Docker 凭据，私有 GHCR 镜像可直接拉取"
 else
   log "提示：未发现 Docker 凭据，若拉取失败请先执行 sudo docker login ghcr.io -u <github-user>"

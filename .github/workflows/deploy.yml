@@ -150,6 +150,19 @@ jobs:
              sudo chown -R \$USER '${{ env.DEPLOY_DIR }}' '${{ env.WEB_ROOT }}' && \
              sudo chmod -R a+rX '${{ env.WEB_ROOT }}'"
 
+      - name: 预检 .env（缺失则提前失败，避免误导性报错）
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          ssh -p "${{ env.SSH_PORT }}" "$SERVER_USER@$SERVER_HOST" \
+            "if [ -f '${{ env.DEPLOY_DIR }}/.env' ]; then \
+               echo '.env 已就绪'; \
+             else \
+               echo '::error::${{ env.DEPLOY_DIR }}/.env 不存在，请先在服务器按 .env.example 创建生产配置（含 HMAIL_IMAGE / POSTGRES_PASSWORD / TOKEN_ENCRYPTION_KEY / PUBLIC_URL）'; \
+               exit 1; \
+             fi"
+
       - name: 同步编排文件与发布脚本
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
