@@ -36,6 +36,16 @@ else
   log "提示：未发现 Docker 凭据，若拉取失败请先执行 sudo docker login ghcr.io -u <github-user>"
 fi
 
+# 拉取前确认远端确实存在该镜像与标签，避免 compose 抛难以定位的 manifest unknown
+image_repo="${HMAIL_IMAGE_VALUE%%:*}"
+image_tag="${HMAIL_IMAGE_VALUE##*:}"
+log "校验远端镜像 ${image_repo}:${image_tag}"
+if ! sudo docker manifest inspect "$HMAIL_IMAGE_VALUE" >/dev/null 2>&1; then
+  sudo docker manifest inspect "$image_repo:latest" >/dev/null 2>&1 \
+    && fail "镜像标签不存在：$HMAIL_IMAGE_VALUE（仓库存在，标签可能写错；可用标签：latest 或某个 commit sha）" \
+    || fail "镜像仓库不存在或无权访问：$image_repo（请核对 owner 是否全小写、与仓库地址一致，以及该包是否可见）"
+fi
+
 log "拉取镜像（服务器不构建）"
 dc pull
 
