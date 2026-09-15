@@ -1,0 +1,30 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Kotlin 编译缓存（Kotlin 2.x 在模块根目录生成）
+.kotlin/
+
+# 构建产物兜底，模块内的 /build 由 android/app/.gitignore 负责
+/app/build
+
+# 打包产物与签名文件不入库
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# Android Studio 记录的本机部署目标
+.idea/deploymentTargetSelector.xml

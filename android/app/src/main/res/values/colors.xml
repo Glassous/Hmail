@@ -1,0 +1,10 @@
+<resources>
+<color name="brand">#155DFC</color><color name="background">#F6F8FC</color>
+<color name="surface">#FFFFFF</color><color name="unread">#FFFFFF</color>
+<color name="read">#F8FAFF</color><color name="ink">#1D293D</color>
+<color name="muted">#62748E</color><color name="outline">#E2E8F0</color>
+<color name="field">#EAF0FA</color><color name="selected">#D3E3FD</color>
+<color name="on_selected">#17365E</color><color name="star">#FFB900</color>
+<color name="error">#C10007</color><color name="white">#FFFFFF</color>
+<color name="black">#000000</color><bool name="light_bars">true</bool>
+</resources>
