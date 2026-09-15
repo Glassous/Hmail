@@ -81,6 +81,11 @@ python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().
 ```
 
 > `HMAIL_IMAGE` 必须与工作流推送的镜像名一致且全小写：`ghcr.io/<owner>/hmail-backend:latest`。
+> 这里的 `<owner>` 是**仓库地址里的账号名**（本仓库为 `Glassous`，小写后是 `glassous`），不是本机用户名或邮箱前缀。
+> 不确定时查 `build` 任务日志中的 `image.name=`，或 `pushing manifest for` 一行，照抄即可。
+>
+> 写错 owner 时部署会在镜像校验阶段报「镜像仓库不存在或无权访问」，写错标签则报「镜像标签不存在」。
+>
 > 不要更换仍在使用的 `TOKEN_ENCRYPTION_KEY`，否则无法解密已连接的邮箱凭据。
 
 ### GitHub 环境（可选但推荐）
