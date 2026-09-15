@@ -1,0 +1,332 @@
+package com.glassous.hmail.ui
+
+import android.content.Context
+import android.view.MotionEvent
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalViewConfiguration
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import com.glassous.hmail.Mail
+import com.glassous.hmail.MailIcon
+import com.glassous.hmail.MailModel
+import com.glassous.hmail.SERVER
+import com.glassous.hmail.enc
+import com.glassous.hmail.openExternal
+import com.glassous.hmail.sizeText
+import com.glassous.hmail.str
+import com.glassous.hmail.ui.common.ConfirmDialog
+import com.glassous.hmail.ui.common.MailPage
+import com.glassous.hmail.ui.common.SecondaryAction
+import com.glassous.hmail.ui.common.SectionText
+import com.glassous.hmail.ui.theme.HmailTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
+import kotlin.math.abs
+
+@Composable
+fun ThreadScreen(
+    model: MailModel,
+    account: String,
+    threadId: String,
+    onBack: () -> Unit,
+    onCompose: () -> Unit,
+    onLabelPick: () -> Unit
+) {
+    revisionOf(model)
+    val context = LocalContext.current
+    val aid = account.ifBlank { model.active }
+    var reload by remember { mutableStateOf(0) }
+    var downloadPath by remember { mutableStateOf<String?>(null) }
+    var menuOpen by remember { mutableStateOf(false) }
+    var pendingTrash by remember { mutableStateOf(false) }
+    val inTrash = model.folder == "TRASH"
+
+    LaunchedEffect(threadId, aid, reload) {
+        if (threadId.isNotBlank()) model.work { model.readThread(aid, threadId) }
+    }
+
+    val saveAttachment = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
+        val path = downloadPath
+        val resolver = context.applicationContext.contentResolver
+        if (uri != null && path != null) {
+            model.work {
+                val bytes = model.api.download(path)
+                withContext(Dispatchers.IO) {
+                    resolver.openOutputStream(uri)?.use { it.write(bytes) } ?: throw java.io.IOException()
+                }
+                model.notice("附件已保存")
+            }
+        }
+        downloadPath = null
+    }
+
+    // 与重构前一致：只有当前载入的会话与路由参数匹配时才渲染，避免串会话。
+    val messages = if (model.messages.firstOrNull()?.threadId == threadId) model.messages else emptyList()
+
+    MailPage(
+        title = "邮件",
+        onBack = onBack,
+        progress = model.busy,
+        actions = {
+            IconButton(onClick = { reload++ }) { MailIcon("refresh", contentDescription = "刷新") }
+            Box {
+                IconButton(onClick = { menuOpen = true }) { MailIcon("more", contentDescription = "更多操作") }
+                val close = { menuOpen = false }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = close) {
+                    ThreadMenuAction("归档", close) {
+                        model.work {
+                            model.modify(remove = listOf("INBOX"), threads = listOf(threadId))
+                            onBack()
+                        }
+                    }
+                    ThreadMenuAction("标为未读", close) {
+                        model.work {
+                            model.modify(add = listOf("UNREAD"), threads = listOf(threadId))
+                            onBack()
+                        }
+                    }
+                    ThreadMenuAction("标记垃圾邮件", close) {
+                        model.work {
+                            model.modify(add = listOf("SPAM"), remove = listOf("INBOX"), threads = listOf(threadId))
+                            onBack()
+                        }
+                    }
+                    ThreadMenuAction(if (inTrash) "恢复邮件" else "移入回收站", close) { pendingTrash = true }
+                    ThreadMenuAction("标签", close) { onLabelPick() }
+                }
+            }
+        }
+    ) {
+        if (messages.isEmpty()) {
+            SectionText("正在加载", muted = true)
+            return@MailPage
+        }
+        SectionText(messages.first().subject, size = 24f, bold = true)
+        messages.forEach { mail ->
+            key(mail.id) {
+                ThreadMessage(
+                    model = model,
+                    mail = mail,
+                    starred = "STARRED" in mail.labels,
+                    aid = aid,
+                    context = context,
+                    onDownloadAttachment = { path, name ->
+                        downloadPath = path
+                        saveAttachment.launch(name)
+                    },
+                    onComposeMode = { mode ->
+                        model.startCompose(mode, mail)
+                        onCompose()
+                    }
+                )
+                HorizontalDivider(
+                    modifier = Modifier.padding(top = 8.dp, bottom = 24.dp),
+                    color = HmailTheme.colors.outline
+                )
+            }
+        }
+    }
+
+    if (pendingTrash) {
+        ConfirmDialog(
+            title = if (inTrash) "恢复这封邮件？" else "移入回收站？",
+            onDismiss = { pendingTrash = false },
+            onConfirm = {
+                pendingTrash = false
+                model.work {
+                    model.modify(
+                        action = if (inTrash) "untrash" else "trash",
+                        threads = listOf(threadId)
+                    )
+                    onBack()
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun ThreadMenuAction(label: String, onDismiss: () -> Unit, action: () -> Unit) {
+    DropdownMenuItem(
+        text = { Text(label) },
+        onClick = {
+            onDismiss()
+            action()
+        }
+    )
+}
+
+@Composable
+private fun ThreadMessage(
+    model: MailModel,
+    mail: Mail,
+    starred: Boolean,
+    aid: String,
+    context: Context,
+    onDownloadAttachment: (String, String) -> Unit,
+    onComposeMode: (String) -> Unit
+) {
+    var detailsVisible by remember { mutableStateOf(false) }
+
+    SectionText(mail.from, size = 16f, bold = true)
+    val details = buildString {
+        append("收件人：").append(mail.raw.str("to")).append('\n')
+        if (mail.raw.str("cc").isNotBlank()) append("抄送：").append(mail.raw.str("cc")).append('\n')
+        append(mail.raw.str("date"))
+    }
+    SecondaryAction("收件详情") { detailsVisible = !detailsVisible }
+    if (detailsVisible) {
+        Spacer(Modifier.height(8.dp))
+        SelectionContainer { SectionText(details, size = 12f, muted = true) }
+    }
+    SecondaryAction(if (starred) "取消星标" else "添加星标") {
+        model.work {
+            model.modify(
+                add = if (starred) emptyList() else listOf("STARRED"),
+                remove = if (starred) listOf("STARRED") else emptyList(),
+                ids = listOf(mail.id)
+            )
+        }
+    }
+
+    if (mail.raw.str("html").isNotBlank()) {
+        HtmlMessage(html = mail.raw.str("html"), aid = aid, context = context, model = model)
+    } else {
+        SelectionContainer { SectionText(mail.raw.str("text").ifBlank { "（无正文）" }, size = 16f) }
+    }
+
+    mail.attachments.forEach { attachment ->
+        SecondaryAction("${attachment.name} · ${sizeText(attachment.size)}") {
+            onDownloadAttachment(
+                model.path("/messages/${enc(mail.id)}/attachments/${enc(attachment.id)}", aid),
+                attachment.name
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+    }
+
+    listOf("回复" to "reply", "回复全部" to "replyAll", "转发" to "forward").forEach { (label, mode) ->
+        SecondaryAction(label) { onComposeMode(mode) }
+        Spacer(Modifier.height(8.dp))
+    }
+}
+
+/**
+ * 来信 HTML 的隔离渲染：关闭脚本、禁用 Cookie 与文件/内容访问、只放行本站代理的签名图片请求，
+ * 按内容高度自适应；触摸协商保证外层列表仍可纵向滚动。安全边界与重构前完全一致。
+ */
+@Composable
+private fun HtmlMessage(html: String, aid: String, context: Context, model: MailModel) {
+    val density = LocalDensity.current
+    val touchSlop = LocalViewConfiguration.current.touchSlop
+    var heightPx by remember { mutableStateOf(0) }
+    val minHeight = with(density) { 180.dp.toPx() }
+    val maxHeight = with(density) { 1800.dp.toPx() }
+    val height = if (heightPx > 0) with(density) { heightPx.toDp() } else 420.dp
+
+    AndroidView(
+        modifier = Modifier.fillMaxWidth().height(height),
+        factory = { ctx ->
+            WebView(ctx).apply {
+                settings.apply {
+                    javaScriptEnabled = false
+                    allowFileAccess = false
+                    allowContentAccess = false
+                    domStorageEnabled = false
+                    mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                    setSupportMultipleWindows(false)
+                    builtInZoomControls = true
+                    displayZoomControls = false
+                }
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
+                CookieManager.getInstance().setAcceptCookie(false)
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        openExternal(context, request.url.toString()) { model.notice(it) }
+                        return true
+                    }
+
+                    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                        val uri = request.url
+                        val allowed = uri.scheme == "https" && uri.host == "hmail.fiacloud.top" &&
+                            (uri.port == -1 || uri.port == 443) && uri.getQueryParameter("sig") != null &&
+                            (
+                                uri.path == "/api/v1/proxy/image" ||
+                                    uri.path.orEmpty().startsWith("/api/v1/gmail-accounts/${enc(aid)}/messages/")
+                                )
+                        return if (allowed) null else WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+                    }
+
+                    override fun onPageFinished(view: WebView, url: String) {
+                        view.postDelayed({
+                            val measured = (view.contentHeight * density.density).toInt()
+                            if (measured > 0) {
+                                val clamped = measured.coerceIn(minHeight.toInt(), maxHeight.toInt())
+                                if (clamped != heightPx) heightPx = clamped
+                            }
+                        }, 200)
+                    }
+                }
+                setBackgroundColor(android.graphics.Color.WHITE)
+                var touchDownY = 0f
+                setOnTouchListener { view, event ->
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            touchDownY = event.y
+                            view.onTouchEvent(event)
+                        }
+                        // 明显的纵向拖动交还外层列表，轻点与横向手势留给 WebView（链接仍可点击）。
+                        MotionEvent.ACTION_MOVE ->
+                            if (abs(event.y - touchDownY) > touchSlop) false else view.onTouchEvent(event)
+                        else -> view.onTouchEvent(event)
+                    }
+                }
+                loadDataWithBaseURL(
+                    SERVER + "/",
+                    "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+                        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src $SERVER; " +
+                        "style-src 'unsafe-inline'; font-src 'none'; form-action 'none'\">" +
+                        "<style>body{margin:12px;font:16px/1.65 sans-serif;overflow-wrap:anywhere;color:#1e293b;background:white}" +
+                        "img{max-width:100%;height:auto}pre{white-space:pre-wrap}table{max-width:100%}</style></head>" +
+                        "<body>$html</body></html>",
+                    "text/html",
+                    "UTF-8",
+                    null
+                )
+            }
+        },
+        onRelease = { view ->
+            view.stopLoading()
+            view.destroy()
+        }
+    )
+}
