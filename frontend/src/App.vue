@@ -2,26 +2,40 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import BrandIcon from './BrandIcon.vue'
+import MailboxPicker from './MailboxPicker.vue'
+import ComposeDialog from './ComposeDialog.vue'
 import { api, ApiError, setCsrf } from './api'
 
 type Account = {id:string; email:string; provider:string; status:string}
+type MailServer = {host:string; port:number; security:'ssl'|'starttls'}
+type MailPreset = {id:string; name:string; domains:string[]; imap:MailServer; smtp:MailServer; hint:string}
 type Attachment = {id:string; name:string; size:number; messageId?:string}
 type Mail = {id:string; threadId:string; from:string; to:string; cc:string; bcc:string; subject:string; snippet:string; date:string; labels:string[]; count?:number; text:string; html:string; messageId:string; references:string; attachments:Attachment[]}
 type Label = {id:string; name:string; type:string}
-const user = ref<any>(null), booting = ref(true), config = ref({oauthEnabled:false, questions:[] as string[], maxAttachmentBytes:18874368})
-const authMode = ref('login'), authBusy = ref(false), auth = reactive({username:'', password:'', question:'', answer:'', newPassword:''}), recoveryToken = ref(''), recoveryAsked = ref(false)
+const user = ref<any>(null), booting = ref(true), config = ref({oauthEnabled:false, emailCodeEnabled:false, maxAttachmentBytes:18874368, mailProviders:[] as MailPreset[]})
+const authMode = ref('login'), authBusy = ref(false), auth = reactive({email:'', password:'', code:''}), codeBusy = ref(false), codeSent = ref(false), codeCooldown = ref(0)
 const accounts = ref<Account[]>([]), activeId = ref(''), folder = ref('INBOX'), query = ref(''), appliedQuery = ref(''), labels = ref<Label[]>([])
 const items = ref<Mail[]>([]), messages = ref<Mail[]>([]), selected = ref<string[]>([]), activeThread = ref(''), nextCursor = ref(''), cursors = ref(['']), pageIndex = ref(0)
 const loading = ref(false), reading = ref(false), syncing = ref(false), sidebar = ref(false), modal = ref(''), error = ref(''), notice = ref(''), theme = ref<'system'|'light'|'dark'>((localStorage.getItem('hmail-theme') as 'system'|'light'|'dark') || 'system')
-const connectionBusy = ref(false), imap = reactive({email:'',password:'',port:465}), showImap = ref(false), changingPassword = reactive({currentPassword:'',password:'',question:'',answer:''})
+const connectionBusy = ref(false), changingPassword = reactive({currentPassword:'',password:''})
+const connection = reactive({email:'',password:'',provider:'',imapHost:'',imapPort:993,imapSecurity:'ssl',smtpHost:'',smtpPort:465,smtpSecurity:'ssl'})
 const labelName = ref(''), labelEdit = ref<Label|null>(null), labelChoice = ref(''), actionBusy = ref(false)
 const composer = ref(false), composeAccount = ref(''), composingBusy = ref(false), uploading = ref(false), savedState = ref(''), composeDirty = ref(false), sendUncertain = ref(false)
 const freshCompose = () => ({to:'',cc:'',bcc:'',subject:'',text:'',inReplyTo:'',references:'',threadId:null as string|null,draftId:null as string|null,composeId:crypto.randomUUID(),version:0,attachments:[] as Attachment[]})
 const draft = reactive(freshCompose())
-let saveTimer: ReturnType<typeof setTimeout> | undefined, toastTimer: ReturnType<typeof setTimeout> | undefined
+const composeStashed = ref(false)
+const composeVisible = computed(() => !!user.value && composer.value && !composeStashed.value)
+function restoreCompose() { sidebar.value=false; composeStashed.value=false }
+function stashCompose() {
+  if(uploading.value || composingBusy.value)return
+  composeStashed.value=true
+  void saveDraft()
+}
+let saveTimer: ReturnType<typeof setTimeout> | undefined, toastTimer: ReturnType<typeof setTimeout> | undefined, codeTimer: ReturnType<typeof setInterval> | undefined
 let savePromise: Promise<void> | null = null, loadGeneration = 0, readGeneration = 0
 const activeAccount = computed(() => accounts.value.find(a => a.id === activeId.value))
 const customLabels = computed(() => labels.value.filter(l => l.type === 'user'))
+const presetHint = computed(() => config.value.mailProviders.find(p => p.id === connection.provider)?.hint || (connection.provider === 'custom' ? '请向邮箱服务商确认 IMAP 与 SMTP 服务器地址、端口与加密方式。' : ''))
 const nav = [{id:'INBOX',name:'收件箱',icon:'inbox'},{id:'STARRED',name:'已加星标',icon:'star'},{id:'SENT',name:'已发送',icon:'send'},{id:'DRAFT',name:'草稿',icon:'edit'},{id:'ALL',name:'所有邮件',icon:'mail'},{id:'SPAM',name:'垃圾邮件',icon:'alert'},{id:'TRASH',name:'回收站',icon:'trash'}]
 const folderTitle = computed(() => nav.find(n=>n.id===folder.value)?.name || labels.value.find(l=>l.id===folder.value)?.name || '邮件')
 const allChecked = computed(() => items.value.length > 0 && selected.value.length === items.value.length)
@@ -36,6 +50,9 @@ const systemMedia = typeof window !== 'undefined' ? window.matchMedia('(prefers-
 function applyTheme() {
   const isDark = theme.value === 'dark' || (theme.value === 'system' && (systemMedia?.matches ?? false))
   document.documentElement.classList.toggle('dark', isDark)
+  document.querySelectorAll('iframe').forEach(frame => {
+    try { if(frame.contentDocument) styleMailScrollbars(frame.contentDocument) } catch {}
+  })
 }
 watch(theme, value => {
   localStorage.setItem('hmail-theme', value)
@@ -53,16 +70,28 @@ async function toggleTheme() {
 async function submitAuth() {
   authBusy.value=true; error.value=''
   try {
-    if(authMode.value==='recover') {
-      if(!recoveryAsked.value) { const result=await api('/auth/recovery-question?username='+encodeURIComponent(auth.username)); auth.question=result.question; recoveryAsked.value=true; return }
-      if(!recoveryToken.value) { recoveryToken.value=(await api('/auth/recover','POST',{username:auth.username,answer:auth.answer})).token; return }
-      await api('/auth/reset','POST',{token:recoveryToken.value,password:auth.newPassword}); switchAuth('login'); toast('密码已重设，请登录'); return
+    if(authMode.value==='login') {
+      const result=await api('/auth/login','POST',{email:auth.email,password:auth.password})
+      user.value=result.user; setCsrf(result.csrf); theme.value=result.user.theme; auth.password=''; await loadAccounts(); return
     }
-    const result=await api('/auth/'+authMode.value,'POST',authMode.value==='register'?{username:auth.username,password:auth.password,question:auth.question,answer:auth.answer}:{username:auth.username,password:auth.password})
-    user.value=result.user; setCsrf(result.csrf); auth.password=''; auth.answer=''; theme.value=result.user.theme; await loadAccounts()
+    const result=await api('/auth/'+authMode.value,'POST',{email:auth.email,password:auth.password,code:auth.code})
+    if(authMode.value==='register') { user.value=result.user; setCsrf(result.csrf); theme.value=result.user.theme; auth.password=''; auth.code=''; await loadAccounts(); return }
+    switchAuth('login'); toast('密码已重设，请使用新密码登录')
   } catch(e) { fail(e) } finally { authBusy.value=false }
 }
-function switchAuth(mode:string) { authMode.value=mode; auth.question=config.value.questions[0]||''; auth.answer=''; auth.password=''; auth.newPassword=''; recoveryAsked.value=false; recoveryToken.value=''; error.value='' }
+function startCooldown(seconds:number) {
+  codeCooldown.value=seconds; clearInterval(codeTimer)
+  codeTimer=setInterval(()=>{ codeCooldown.value--; if(codeCooldown.value<=0) clearInterval(codeTimer) },1000)
+}
+async function sendCode() {
+  if(!auth.email) { error.value='请先填写邮箱地址'; return }
+  codeBusy.value=true; error.value=''
+  try {
+    const result=await api('/auth/send-code','POST',{email:auth.email,purpose:authMode.value==='register'?'register':'reset'})
+    codeSent.value=true; toast('验证码已发送，请查收邮件'); startCooldown(result.cooldown||60)
+  } catch(e) { fail(e) } finally { codeBusy.value=false }
+}
+function switchAuth(mode:string) { authMode.value=mode; auth.password=''; auth.code=''; codeSent.value=false; codeCooldown.value=0; clearInterval(codeTimer); error.value='' }
 async function logout() { try { await closeCompose(); if(composer.value)return; await api('/auth/logout','POST'); user.value=null; accounts.value=[]; activeId.value=''; modal.value=''; setCsrf('') } catch(e){fail(e)} }
 async function loadAccounts() {
   accounts.value=await api('/gmail-accounts')
@@ -107,6 +136,7 @@ function onIframeLoad(e: Event) {
   try {
     const doc = iframe.contentDocument || iframe.contentWindow?.document
     if (doc?.documentElement) {
+      styleMailScrollbars(doc)
       const resize = () => {
         const height = Math.max(doc.body?.scrollHeight || 0, doc.documentElement.scrollHeight || 0)
         if (height > 0) iframe.style.height = `${height + 24}px`
@@ -119,16 +149,44 @@ function onIframeLoad(e: Event) {
   } catch {}
 }
 
+function styleMailScrollbars(doc: Document) {
+  const dark = document.documentElement.classList.contains('dark')
+  let style = doc.getElementById('hmail-scrollbars') as HTMLStyleElement | null
+  if(!style) { style=doc.createElement('style');style.id='hmail-scrollbars';(doc.head || doc.documentElement).append(style) }
+  style.textContent=`:root{--scroll-thumb:${dark?'#52647d':'#bcc9dc'};--scroll-hover:${dark?'#7992b2':'#889fbf'};--scroll-track:${dark?'#19212e':'#f1f5fa'}}*{scrollbar-width:thin;scrollbar-color:var(--scroll-thumb) var(--scroll-track)}::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:var(--scroll-track)}::-webkit-scrollbar-thumb{background:var(--scroll-thumb);border:2px solid var(--scroll-track);border-radius:99px}::-webkit-scrollbar-thumb:hover{background:var(--scroll-hover)}`
+}
+
 async function oauthConnect() { connectionBusy.value=true;try{const result=await api('/gmail-accounts/oauth/start','POST');location.assign(result.url)}catch(e){fail(e);connectionBusy.value=false} }
-async function imapConnect() { connectionBusy.value=true;try{const account=await api('/gmail-accounts/imap','POST',imap);imap.password='';modal.value='';await loadAccounts();activeId.value=account.id;toast('Gmail 已连接')}catch(e){fail(e)}finally{connectionBusy.value=false} }
-async function disconnect(account:Account) { if(!confirm(`断开 ${account.email}？Gmail 中的邮件将保留。`))return;try{await api('/gmail-accounts/'+account.id,'DELETE');await loadAccounts();toast('已断开连接')}catch(e){fail(e)} }
-async function changePassword() { try{await api('/me/password','POST',{...changingPassword,...(!changingPassword.question?{question:null,answer:null}:{})});changingPassword.currentPassword='';changingPassword.password='';changingPassword.answer='';user.value=null;modal.value='';toast('密码已修改，请重新登录')}catch(e){fail(e)} }
+function applyPreset(id:string) {
+  connection.provider=id
+  const preset=config.value.mailProviders.find(p=>p.id===id)
+  if(!preset){connection.imapHost='';connection.smtpHost='';connection.imapPort=993;connection.smtpPort=465;connection.imapSecurity='ssl';connection.smtpSecurity='ssl';return}
+  connection.imapHost=preset.imap.host;connection.imapPort=preset.imap.port;connection.imapSecurity=preset.imap.security
+  connection.smtpHost=preset.smtp.host;connection.smtpPort=preset.smtp.port;connection.smtpSecurity=preset.smtp.security
+}
+function detectProvider() {
+  if(connection.provider)return
+  const domain=(connection.email.split('@')[1]||'').trim().toLowerCase()
+  if(!domain)return
+  const preset=config.value.mailProviders.find(p=>p.domains.includes(domain))
+  if(preset)applyPreset(preset.id)
+}
+function openConnect() { modal.value='connect';connection.password='';connection.provider='';connection.imapHost='';connection.smtpHost='';connection.imapPort=993;connection.smtpPort=465;connection.imapSecurity='ssl';connection.smtpSecurity='ssl';detectProvider() }
+async function imapConnect() {
+  connectionBusy.value=true
+  try {
+    const account=await api('/gmail-accounts/imap','POST',{email:connection.email,password:connection.password,imapHost:connection.imapHost,imapPort:connection.imapPort,imapSecurity:connection.imapSecurity,smtpHost:connection.smtpHost,smtpPort:connection.smtpPort,smtpSecurity:connection.smtpSecurity})
+    connection.password='';modal.value='';await loadAccounts();activeId.value=account.id;toast('邮箱已连接')
+  } catch(e){fail(e)} finally{connectionBusy.value=false}
+}
+async function disconnect(account:Account) { if(!confirm(`断开 ${account.email}？邮箱中的邮件将保留。`))return;try{await api('/gmail-accounts/'+account.id,'DELETE');await loadAccounts();toast('已断开连接')}catch(e){fail(e)} }
+async function changePassword() { try{await api('/me/password','POST',{currentPassword:changingPassword.currentPassword,password:changingPassword.password});changingPassword.currentPassword='';changingPassword.password='';user.value=null;modal.value='';setCsrf('');toast('密码已修改，请重新登录')}catch(e){fail(e)} }
 async function saveLabel() { try{await api(path('/labels'),'POST',{action:labelEdit.value?'rename':'create',id:labelEdit.value?.id||'',name:labelName.value});labels.value=await api(path('/labels'));modal.value='';toast('标签已保存')}catch(e){fail(e)} }
 async function deleteLabel(label:Label) { if(!confirm(`删除标签“${label.name}”？邮件仍保留。`))return;try{await api(path('/labels'),'POST',{action:'delete',id:label.id});labels.value=await api(path('/labels'));if(folder.value===label.id)await chooseFolder('INBOX')}catch(e){fail(e)} }
 
 async function newCompose(mode='', message?:Mail) {
-  if(composer.value){toast('请先保存并关闭当前写信窗口');return}
-  if(!activeId.value){modal.value='connect';return}
+  if(composer.value){restoreCompose();if(mode || message)toast('请先保存并关闭当前写信窗口');return}
+  if(!activeId.value){openConnect();return}
   Object.assign(draft,freshCompose()); composeAccount.value=activeId.value; savedState.value='';sendUncertain.value=false
   if(message){
     draft.subject=/^(re|fwd):/i.test(message.subject)?message.subject:(mode==='forward'?'Fwd: ':'Re: ')+message.subject
@@ -140,10 +198,11 @@ async function newCompose(mode='', message?:Mail) {
     } else draft.attachments=message.attachments.map(a=>({...a,messageId:message.id}))
     draft.text='\n\n'+(mode==='forward'?'---------- 转发邮件 ----------':'在 '+message.date+'，'+message.from+' 写道：')+'\n'+message.text.split('\n').map(l=>'> '+l).join('\n')
   }
-  composer.value=true;composeDirty.value=false
+  restoreCompose();composer.value=true;composeDirty.value=false
+  if(message)dirty()
 }
 async function openDraft(item:Mail) {
-  if(composer.value){toast('请先保存并关闭当前写信窗口');return}
+  if(composer.value){restoreCompose();toast('请先保存并关闭当前写信窗口');return}
   reading.value=true
   try{
     const list=await api<any[]>(path('/drafts')); let found=list.find(d=>d.messageId===item.id||d.id===item.id)
@@ -155,28 +214,28 @@ async function openDraft(item:Mail) {
 }
 function dirty() { composeDirty.value=true;savedState.value='尚未保存';clearTimeout(saveTimer);if(!sendUncertain.value)saveTimer=setTimeout(()=>{void saveDraft()},2000) }
 async function saveDraft() {
-  if(!composer.value||!composeDirty.value||sendUncertain.value)return
+  if(!composer.value||!composeDirty.value||sendUncertain.value||uploading.value)return
   if(savePromise){await savePromise;if(composeDirty.value)return saveDraft();return}
   composingBusy.value=true;composeDirty.value=false;savedState.value='正在保存…';draft.version++
   const payload=JSON.parse(JSON.stringify(draft));const aid=composeAccount.value
-  savePromise=(async()=>{try{const result=await api(path('/drafts',aid),'PUT',payload);draft.draftId=result.id;draft.attachments=draft.attachments.map(a=>{const index=payload.attachments.findIndex((old:Attachment)=>old.id===a.id&&old.messageId===a.messageId);return index>=0&&result.attachments?.[index]?result.attachments[index]:a});savedState.value='已保存至 Gmail';}catch(e){composeDirty.value=true;savedState.value='保存失败，请重试';fail(e)}finally{composingBusy.value=false}})()
+  savePromise=(async()=>{try{const result=await api(path('/drafts',aid),'PUT',payload);draft.draftId=result.id;draft.attachments=draft.attachments.map(a=>{const index=payload.attachments.findIndex((old:Attachment)=>old.id===a.id&&old.messageId===a.messageId);return index>=0&&result.attachments?.[index]?result.attachments[index]:a});savedState.value='已保存至邮箱';}catch(e){composeDirty.value=true;savedState.value='保存失败，请重试';fail(e)}finally{composingBusy.value=false}})()
   await savePromise;savePromise=null
 }
-async function closeCompose() { clearTimeout(saveTimer);if(savePromise)await savePromise; if(composeDirty.value&&!sendUncertain.value)await saveDraft();if(composeDirty.value&&!sendUncertain.value){toast('草稿未保存，请重试后关闭');return}composer.value=false;await loadList() }
-async function discardCompose() { if(!confirm('丢弃这封草稿？'))return;clearTimeout(saveTimer);if(savePromise)await savePromise;try{if(draft.draftId)await api(path('/drafts/'+encodeURIComponent(draft.draftId),composeAccount.value),'DELETE');composer.value=false;composeDirty.value=false;await loadList()}catch(e){fail(e)} }
+async function closeCompose() { if(uploading.value||composingBusy.value)return;clearTimeout(saveTimer);if(savePromise)await savePromise; if(composeDirty.value&&!sendUncertain.value)await saveDraft();if(composeDirty.value&&!sendUncertain.value){toast('草稿未保存，请重试后关闭');return}composer.value=false;composeStashed.value=false;await loadList() }
+async function discardCompose() { if(uploading.value||composingBusy.value)return;if(!confirm('丢弃这封草稿？'))return;clearTimeout(saveTimer);if(savePromise)await savePromise;try{if(draft.draftId)await api(path('/drafts/'+encodeURIComponent(draft.draftId),composeAccount.value),'DELETE');composer.value=false;composeStashed.value=false;composeDirty.value=false;await loadList()}catch(e){fail(e)} }
 async function uploadFiles(event:Event) { const input=event.target as HTMLInputElement;const files=Array.from(input.files||[]);if(!files.length)return;uploading.value=true;clearTimeout(saveTimer);try{for(const file of files){if(draft.attachments.reduce((sum,a)=>sum+a.size,0)+file.size>config.value.maxAttachmentBytes)throw new Error('附件总大小不能超过 18 MiB');const form=new FormData();form.append('file',file);draft.attachments.push(await api(path('/attachments',composeAccount.value),'POST',form))}dirty()}catch(e){fail(e)}finally{uploading.value=false;input.value=''} }
 async function sendMail() {
+  if(composingBusy.value||uploading.value||sendUncertain.value)return
   clearTimeout(saveTimer);if(savePromise)await savePromise;composingBusy.value=true
   try{const result=await api(path('/send',composeAccount.value),'POST',draft);composer.value=false;composeDirty.value=false;toast(result.warning||(result.result?.refused?.length?'邮件已发送，但部分收件人被拒绝：'+result.result.refused.join(', '):'邮件已发送'));await loadList()}
   catch(e){if(e instanceof ApiError&&e.code==='send_uncertain'){sendUncertain.value=true;savedState.value='发送结果待确认'}fail(e)}finally{composingBusy.value=false}
 }
-function beforeUnload(e:BeforeUnloadEvent) {if(composer.value&&(composeDirty.value||composingBusy.value)){e.preventDefault();e.returnValue=''}}
+function beforeUnload(e:BeforeUnloadEvent) {if(composer.value&&(composeDirty.value||composingBusy.value||uploading.value)){e.preventDefault();e.returnValue=''}}
 onMounted(async()=>{
   systemMedia?.addEventListener('change', applyTheme)
   window.addEventListener('beforeunload', beforeUnload)
   try {
     config.value = await api('/config')
-    auth.question = config.value.questions[0] || ''
     try {
       const session = await api('/me')
       user.value = session.user
@@ -200,6 +259,7 @@ onMounted(async()=>{
 onUnmounted(()=>{
   clearTimeout(saveTimer)
   clearTimeout(toastTimer)
+  clearInterval(codeTimer)
   systemMedia?.removeEventListener('change', applyTheme)
   window.removeEventListener('beforeunload', beforeUnload)
 })
@@ -212,49 +272,57 @@ onUnmounted(()=>{
     <div class="grid w-full max-w-5xl overflow-hidden rounded-[32px] border divider surface shadow-xl shadow-slate-200/40 dark:shadow-none lg:grid-cols-2">
       <section class="relative hidden flex-col justify-between overflow-hidden bg-[#e8f0fe] p-12 text-slate-800 lg:flex">
         <div class="flex items-center gap-3"><BrandIcon :size="44"/><span class="text-2xl font-semibold tracking-tight">Hmail<span class="text-blue-600">.</span></span></div>
-        <div class="py-20"><div class="mb-5 text-xs font-semibold uppercase tracking-[.3em] text-blue-600">A little more organized</div><h1 class="text-4xl font-semibold leading-snug tracking-tight">让邮件归位，<br/>让思绪留白。</h1><p class="mt-5 max-w-xs text-sm leading-7 text-slate-500">连接你的 Gmail，让每一次收发都井然有序。熟悉的邮箱，更专注的空间。</p>
+        <div class="py-20"><div class="mb-5 text-xs font-semibold uppercase tracking-[.3em] text-blue-600">A little more organized</div><h1 class="text-4xl font-semibold leading-snug tracking-tight">让邮件归位，<br/>让思绪留白。</h1><p class="mt-5 max-w-xs text-sm leading-7 text-slate-500">连接你的邮箱，让每一次收发都井然有序。熟悉的邮箱，更专注的空间。</p>
         <div class="mt-10 rotate-[-3deg] rounded-2xl bg-white/90 p-5 shadow-xl shadow-blue-200/30"><div class="flex items-center gap-3"><span class="flex h-10 w-10 items-center justify-center rounded-full bg-blue-100 text-blue-600"><Icon name="inbox"/></span><div><div class="text-sm font-semibold">给重要的事，多一点空间</div><div class="mt-1 text-xs text-slate-400">收发 · 整理 · 专注</div></div><Icon name="check" class="ml-auto text-blue-500"/></div><div class="mt-5 h-2 w-4/5 rounded bg-slate-100"></div><div class="mt-3 h-2 w-3/5 rounded bg-slate-100"></div></div></div>
         <p class="flex items-center gap-2 text-xs text-slate-500"><Icon name="shield" :size="16"/>你的邮箱，由你掌控</p>
       </section>
       <section class="p-8 sm:p-12 lg:p-14">
         <div class="mb-12 flex items-center gap-2 text-xl font-semibold lg:hidden"><BrandIcon :size="32"/>Hmail.</div>
-        <div class="mb-8"><p class="mb-3 text-xs font-medium tracking-widest text-blue-600">WELCOME TO HMAIL</p><h2 class="text-3xl font-semibold tracking-tight">{{authMode==='login'?'欢迎回来':authMode==='register'?'创建你的账户':'找回密码'}}</h2><p class="mt-3 text-sm text-slate-500">{{authMode==='login'?'登录后，即可连接你的 Gmail 邮箱。':authMode==='register'?'从一个属于自己的邮件空间开始。':'通过注册时设置的密保问题验证身份。'}}</p></div>
+        <div class="mb-8"><p class="mb-3 text-xs font-medium tracking-widest text-blue-600">WELCOME TO HMAIL</p><h2 class="text-3xl font-semibold tracking-tight">{{authMode==='login'?'欢迎回来':authMode==='register'?'创建你的账户':'找回密码'}}</h2><p class="mt-3 text-sm text-slate-500">{{authMode==='login'?'登录后，即可连接你的邮箱。':authMode==='register'?'使用邮箱验证码注册，开启属于自己的邮件空间。':'通过注册邮箱接收验证码来重设密码。'}}</p></div>
         <form class="space-y-5" @submit.prevent="submitAuth">
-          <label class="block text-sm">用户名<input v-model="auth.username" :disabled="authMode==='recover'&&recoveryAsked" required minlength="3" maxlength="40" pattern="[a-zA-Z0-9_-]+" autocomplete="username" class="field mt-2" placeholder="字母、数字、下划线或短横线"/></label>
-          <label v-if="authMode!=='recover'" class="block text-sm">密码<input v-model="auth.password" required minlength="10" maxlength="128" type="password" :autocomplete="authMode==='login'?'current-password':'new-password'" class="field mt-2" placeholder="至少 10 个字符"/></label>
-          <template v-if="authMode==='register'||(authMode==='recover'&&recoveryAsked&&!recoveryToken)"><label class="block text-sm">密保问题<select v-if="authMode==='register'" v-model="auth.question" class="field mt-2"><option v-for="q in config.questions" :key="q">{{q}}</option></select><div v-else class="mt-2 rounded-xl bg-slate-50 p-3 dark:bg-slate-800">{{auth.question}}</div></label><label class="block text-sm">密保答案<input v-model="auth.answer" required minlength="2" maxlength="200" type="password" autocomplete="off" class="field mt-2" placeholder="请牢记答案，找回密码时需要"/></label></template>
-          <label v-if="recoveryToken" class="block text-sm">新密码<input v-model="auth.newPassword" type="password" required minlength="10" maxlength="128" autocomplete="new-password" class="field mt-2" placeholder="至少 10 个字符"/></label>
-          <button v-if="authMode==='login'" type="button" class="block text-xs text-blue-600" @click="switchAuth('recover')">忘记密码？</button>
-          <button class="primary w-full !py-3.5" :disabled="authBusy"><Icon v-if="authBusy" name="refresh" :size="16" class="animate-spin"/>{{authMode==='login'?'登录':authMode==='register'?'创建账户':recoveryToken?'重设密码':recoveryAsked?'验证答案':'继续'}}<Icon v-if="!authBusy" name="chevron" :size="16"/></button>
+          <label class="block text-sm">邮箱<input v-model="auth.email" required type="email" maxlength="254" autocomplete="email" class="field mt-2" placeholder="you@example.com"/></label>
+          <label v-if="authMode==='login'" class="block text-sm">密码<input v-model="auth.password" required minlength="10" maxlength="128" type="password" autocomplete="current-password" class="field mt-2" placeholder="至少 10 个字符"/></label>
+          <template v-else>
+            <label class="block text-sm">邮箱验证码<span class="mt-2 flex gap-2"><input v-model="auth.code" required inputmode="numeric" pattern="\d{6}" minlength="6" maxlength="6" autocomplete="one-time-code" class="field flex-1" placeholder="6 位数字验证码"/><button type="button" class="secondary shrink-0 whitespace-nowrap" :disabled="codeBusy||codeCooldown>0" @click="sendCode"><Icon v-if="codeBusy" name="refresh" :size="14" class="animate-spin"/>{{codeCooldown>0?codeCooldown+' 秒后重发':'获取验证码'}}</button></span></label>
+            <label class="block text-sm">{{authMode==='register'?'密码':'新密码'}}<input v-model="auth.password" required minlength="10" maxlength="128" type="password" autocomplete="new-password" class="field mt-2" placeholder="至少 10 个字符"/></label>
+          </template>
+          <p v-if="authMode!=='login'&&!config.emailCodeEnabled" class="text-xs leading-6 text-amber-600">邮件服务尚未配置，暂时无法发送验证码，请联系管理员。</p>
+          <button v-if="authMode==='login'" type="button" class="block text-xs text-blue-600" @click="switchAuth('reset')">忘记密码？</button>
+          <button class="primary w-full !py-3.5" :disabled="authBusy||(authMode!=='login'&&!config.emailCodeEnabled)"><Icon v-if="authBusy" name="refresh" :size="16" class="animate-spin"/>{{authMode==='login'?'登录':authMode==='register'?'创建账户':'重设密码'}}<Icon v-if="!authBusy" name="chevron" :size="16"/></button>
         </form>
         <p class="mt-8 text-center text-sm text-slate-500">{{authMode==='login'?'还没有账户？':'已有账户？'}} <button class="font-medium text-blue-600" @click="switchAuth(authMode==='login'?'register':'login')">{{authMode==='login'?'立即注册':'返回登录'}}</button></p>
-        <p class="mt-10 text-center text-xs leading-6 text-slate-400">平台账户与你的 Google 账户独立。<br/>登录后选择 OAuth 或应用专用密码连接。</p>
+        <p class="mt-10 text-center text-xs leading-6 text-slate-400">平台账户与你的邮箱账户独立。<br/>登录后选择 Google 授权或 IMAP＋SMTP 连接。</p>
       </section>
     </div>
   </div>
 
-  <div v-else class="flex h-dvh flex-col overflow-hidden">
+  <div v-else id="mail-workspace" class="flex h-dvh flex-col overflow-hidden">
     <header class="flex h-[76px] shrink-0 items-center gap-3 px-4 md:gap-5 md:px-6">
       <button class="icon-btn lg:hidden" aria-label="打开侧边栏" @click="sidebar=!sidebar"><Icon name="menu"/></button>
       <a href="/" class="flex w-auto shrink-0 items-center gap-3 lg:w-[218px]" aria-label="Hmail 首页"><BrandIcon/><span class="hidden text-[23px] font-semibold tracking-tight sm:block">Hmail<span class="text-blue-600">.</span></span></a>
-      <form class="flex h-12 min-w-0 max-w-3xl flex-1 items-center rounded-full bg-[#eaf0fa] px-4 dark:bg-slate-800" @submit.prevent="search"><Icon name="search" class="shrink-0 text-slate-500"/><input v-model="query" :disabled="!activeId" class="w-full bg-transparent px-3 text-sm outline-none focus-visible:ring-0" placeholder="搜索邮件" aria-label="搜索邮件，支持 Gmail 搜索语法"/><button v-if="query" type="button" class="text-slate-500" aria-label="清空搜索" @click="query='';search()"><Icon name="close" :size="16"/></button></form>
-      <div class="ml-auto flex items-center"><button class="flex h-9 w-9 items-center justify-center rounded-full bg-[#d3e3fd] text-sm font-semibold text-blue-800 ring-4 ring-white dark:ring-slate-800" :aria-label="user.username+' 的账户设置'" @click="modal='settings'">{{initials(user.username)}}</button></div>
+      <form class="flex h-12 min-w-0 max-w-3xl flex-1 items-center rounded-full bg-[#eaf0fa] px-4 dark:bg-slate-800" @submit.prevent="search"><Icon name="search" class="shrink-0 text-slate-500"/><input v-model="query" :disabled="!activeId" class="w-full bg-transparent px-3 text-sm outline-none focus-visible:ring-0" placeholder="搜索邮件" aria-label="搜索邮件，支持 from:、to:、subject: 前缀"/><button v-if="query" type="button" class="text-slate-500" aria-label="清空搜索" @click="query='';search()"><Icon name="close" :size="16"/></button></form>
+
     </header>
     <div class="flex min-h-0 flex-1 pb-3 pr-3">
       <div v-if="sidebar" class="fixed inset-0 z-30 bg-slate-900/30 lg:hidden" @click="sidebar=false"></div>
       <aside class="fixed inset-y-0 left-0 z-40 flex w-[260px] shrink-0 flex-col bg-[#f6f8fc] px-4 pb-4 pt-6 transition-transform dark:bg-[#10151e] lg:static lg:translate-x-0 lg:pt-1" :class="sidebar?'translate-x-0':'-translate-x-full'">
         <a href="/" class="mb-5 flex shrink-0 items-center gap-3 px-2 lg:hidden" aria-label="Hmail 首页"><BrandIcon :size="40"/><span class="text-lg font-semibold tracking-tight">Hmail<span class="text-violet-500">.</span></span></a>
-        <button class="mb-6 ml-1 flex w-fit items-center gap-4 rounded-2xl bg-[#c2e7ff] px-6 py-4 font-medium text-[#16394f] shadow-sm transition hover:shadow-md" @click="newCompose()"><Icon name="edit" :size="22"/>写邮件</button>
-        <div class="mb-4 px-2"><label class="caption mb-2 block uppercase tracking-wider" for="account-select">当前邮箱</label><select id="account-select" v-model="activeId" class="w-full truncate rounded-lg border-0 bg-transparent py-2 text-xs font-medium dark:bg-[#10151e]" :disabled="!accounts.length"><option v-if="!accounts.length" value="">尚未连接邮箱</option><option v-for="account in accounts" :key="account.id" :value="account.id">{{account.email}}</option></select></div>
+        <button class="mb-6 ml-1 flex shrink-0 w-fit items-center gap-4 rounded-2xl bg-[#c2e7ff] px-6 py-4 font-medium text-[#16394f] shadow-sm transition hover:shadow-md" @click="newCompose()"><Icon name="edit" :size="22"/>写邮件</button>
+        <MailboxPicker v-model="activeId" :accounts="accounts" :hidden="!sidebar"/>
+        <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <nav class="space-y-1"><button v-for="n in nav" :key="n.id" class="flex w-full items-center gap-4 rounded-full px-5 py-2.5 text-sm transition" :class="folder===n.id?'bg-[#d3e3fd] font-semibold text-[#17365e] dark:bg-blue-900/50 dark:text-blue-200':'text-slate-600 hover:bg-slate-200/60 dark:text-slate-400 dark:hover:bg-slate-800'" :disabled="!activeId" @click="chooseFolder(n.id)"><Icon :name="n.icon" :size="19"/>{{n.name}}<span v-if="n.id==='INBOX'&&folder==='INBOX'&&items.filter(m=>m.labels.includes('UNREAD')).length" class="ml-auto text-xs">{{items.filter(m=>m.labels.includes('UNREAD')).length}}</span></button></nav>
         <div class="mt-7 flex items-center justify-between px-5"><span class="text-xs font-medium text-slate-500">标签</span><button class="text-slate-500 hover:text-blue-600" aria-label="新建标签" :disabled="!activeId" @click="labelEdit=null;labelName='';modal='label'"><Icon name="plus" :size="17"/></button></div>
-        <div class="mt-2 min-h-0 overflow-y-auto"><div v-for="label in customLabels" :key="label.id" class="group flex items-center rounded-full" :class="folder===label.id?'bg-blue-100 dark:bg-blue-900/30':''"><button class="flex min-w-0 flex-1 items-center gap-4 px-5 py-2.5 text-sm text-slate-500" @click="chooseFolder(label.id)"><Icon name="tag" :size="17" class="shrink-0"/><span class="truncate">{{label.name}}</span></button><button class="mr-2 text-slate-400 opacity-0 focus:opacity-100 group-hover:opacity-100" :aria-label="'编辑标签 '+label.name" @click="labelEdit=label;labelName=label.name;modal='label'"><Icon name="edit" :size="14"/></button></div><p v-if="!customLabels.length" class="px-5 py-3 text-xs text-slate-400">用标签整理你的邮件</p></div>
-        <div class="mt-auto space-y-2 pt-4">
+        <div class="mt-2"><div v-for="label in customLabels" :key="label.id" class="group flex items-center rounded-full" :class="folder===label.id?'bg-blue-100 dark:bg-blue-900/30':''"><button class="flex min-w-0 flex-1 items-center gap-4 px-5 py-2.5 text-sm text-slate-500" @click="chooseFolder(label.id)"><Icon name="tag" :size="17" class="shrink-0"/><span class="truncate">{{label.name}}</span></button><button class="mr-2 text-slate-400 opacity-0 focus:opacity-100 group-hover:opacity-100" :aria-label="'编辑标签 '+label.name" @click="labelEdit=label;labelName=label.name;modal='label'"><Icon name="edit" :size="14"/></button></div><p v-if="!customLabels.length" class="px-5 py-3 text-xs text-slate-400">用标签整理你的邮件</p></div>
+        </div>
+        <div class="mt-auto shrink-0 space-y-2 border-t divider pt-4">
           <div class="space-y-1.5">
-            <button class="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-xs font-medium text-slate-600 transition hover:bg-slate-200/60 dark:text-slate-400 dark:hover:bg-slate-800" aria-label="账户设置" @click="modal='settings'">
-              <Icon name="settings" :size="17"/>
-              <span>账户设置</span>
-            </button>
+            <div class="flex items-center gap-2 pb-2">
+              <button class="flex min-w-0 flex-1 items-center gap-2 rounded-xl px-2 py-2 text-xs font-medium text-slate-600 transition hover:bg-slate-200/60 dark:text-slate-300 dark:hover:bg-slate-800" :aria-label="user.email+' 的账户设置'" @click="modal='settings'">
+                <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#d3e3fd] text-sm font-semibold text-blue-800 dark:bg-blue-900/60 dark:text-blue-200">{{initials(user.email)}}</span>
+                <span class="whitespace-nowrap">账户设置</span>
+              </button>
+              <button class="inline-flex shrink-0 items-center gap-1 rounded-xl bg-blue-600 px-3 py-3 text-xs font-medium text-white transition hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-400" @click="openConnect"><Icon name="plus" :size="15"/>新连接</button>
+            </div>
             <div class="flex items-center rounded-xl bg-slate-200/60 p-1 dark:bg-slate-800/70" role="radiogroup" aria-label="主题模式选择">
               <button type="button" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg py-1.5 text-xs transition" :class="theme==='system'?'bg-white font-medium text-blue-600 shadow-sm dark:bg-slate-700 dark:text-blue-300':'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'" title="跟随系统" :aria-checked="theme==='system'" role="radio" @click="setTheme('system')">
                 <Icon name="system" :size="14"/><span>系统</span>
@@ -267,18 +335,16 @@ onUnmounted(()=>{
               </button>
             </div>
           </div>
-          <button class="flex w-full items-center gap-3 rounded-xl border border-dashed border-slate-300 px-4 py-3 text-xs text-slate-500 transition hover:border-blue-400 hover:text-blue-600 dark:border-slate-700" @click="modal='connect'">
-            <Icon name="plus" :size="17"/>连接 Gmail 邮箱
-          </button>
+
         </div>
       </aside>
       <main class="surface relative flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border divider lg:rounded-3xl">
         <template v-if="!activeId">
           <div class="flex h-16 items-center border-b divider px-6"><h1 class="text-sm font-medium">你的邮件空间</h1><span class="ml-auto caption">准备就绪</span></div>
-          <div class="flex flex-1 flex-col items-center justify-center px-6 pb-12 text-center"><div class="relative mb-8"><div class="absolute -inset-5 rounded-full bg-blue-50 dark:bg-blue-900/10"></div><div class="relative flex h-24 w-24 items-center justify-center rounded-[28px] bg-[#e8f0fe] text-blue-500 dark:bg-blue-900/40"><Icon name="inbox" :size="44"/></div><span class="absolute -bottom-2 -right-2 rounded-full border-4 border-white bg-blue-600 p-2 text-white dark:border-slate-800"><Icon name="plus" :size="16"/></span></div><p class="mb-3 text-xs font-medium uppercase tracking-[.22em] text-blue-500">Your inbox starts here</p><h1 class="text-2xl font-semibold tracking-tight">欢迎来到你的新收件箱</h1><p class="mt-4 max-w-sm text-sm leading-7 text-slate-500">连接一个 Gmail 邮箱，就能在这里收发邮件、整理标签，找回专注的节奏。</p><button class="primary mt-7" @click="modal='connect'"><Icon name="plus" :size="18"/>连接 Gmail</button><div class="mt-10 flex gap-7 text-xs text-slate-400"><span class="flex items-center gap-2"><Icon name="shield" :size="15"/>凭据加密</span><span class="flex items-center gap-2"><Icon name="grid" :size="15"/>多邮箱切换</span></div></div>
+          <div class="flex flex-1 flex-col items-center justify-center px-6 pb-12 text-center"><div class="relative mb-8"><div class="absolute -inset-5 rounded-full bg-blue-50 dark:bg-blue-900/10"></div><div class="relative flex h-24 w-24 items-center justify-center rounded-[28px] bg-[#e8f0fe] text-blue-500 dark:bg-blue-900/40"><Icon name="inbox" :size="44"/></div><span class="absolute -bottom-2 -right-2 rounded-full border-4 border-white bg-blue-600 p-2 text-white dark:border-slate-800"><Icon name="plus" :size="16"/></span></div><p class="mb-3 text-xs font-medium uppercase tracking-[.22em] text-blue-500">Your inbox starts here</p><h1 class="text-2xl font-semibold tracking-tight">欢迎来到你的新收件箱</h1><p class="mt-4 max-w-sm text-sm leading-7 text-slate-500">连接一个邮箱，就能在这里收发邮件、整理文件夹，找回专注的节奏。</p><button class="primary mt-7" @click="openConnect"><Icon name="plus" :size="18"/>连接邮箱</button><div class="mt-10 flex gap-7 text-xs text-slate-400"><span class="flex items-center gap-2"><Icon name="shield" :size="15"/>凭据加密</span><span class="flex items-center gap-2"><Icon name="grid" :size="15"/>多邮箱切换</span></div></div>
         </template>
         <template v-else>
-          <div v-if="activeAccount?.status==='reconnect'" class="flex items-center gap-3 bg-amber-50 px-5 py-3 text-xs text-amber-800 dark:bg-amber-950/40"><Icon name="alert" :size="16"/>连接已失效，请重新授权或更新应用专用密码。<button class="ml-auto underline" @click="modal='connect'">重新连接</button></div>
+          <div v-if="activeAccount?.status==='reconnect'" class="flex items-center gap-3 bg-amber-50 px-5 py-3 text-xs text-amber-800 dark:bg-amber-950/40"><Icon name="alert" :size="16"/>连接已失效，请重新连接或更新密码/授权码。<button class="ml-auto underline" @click="openConnect">重新连接</button></div>
           <div class="flex min-h-16 shrink-0 items-center gap-1 border-b divider px-3 sm:px-5">
             <button v-if="activeThread" class="icon-btn" aria-label="返回列表" @click="activeThread='';messages=[]"><Icon name="back"/></button><label v-else class="flex h-10 w-9 items-center justify-center"><input type="checkbox" :checked="allChecked" :disabled="!items.length" aria-label="选择本页全部邮件" class="h-4 w-4 accent-blue-600" @change="checkAll"/></label>
             <button class="icon-btn" :disabled="syncing||!activeId" aria-label="刷新邮箱" @click="refresh()"><Icon name="refresh" :class="syncing?'animate-spin':''" :size="18"/></button>
@@ -286,7 +352,7 @@ onUnmounted(()=>{
             <span v-else class="ml-2 hidden text-sm font-medium sm:block">{{folderTitle}}</span>
             <div v-if="!activeThread" class="ml-auto flex shrink-0 items-center gap-1"><span class="mr-2 hidden text-xs text-slate-400 sm:inline">{{items.length?`第 ${pageIndex+1} 页 · ${items.length} 个会话`:'暂无邮件'}}</span><button class="icon-btn" :disabled="pageIndex===0||loading" aria-label="上一页" @click="paginate(-1)"><Icon name="chevron" :size="16" class="rotate-180"/></button><button class="icon-btn" :disabled="!nextCursor||loading" aria-label="下一页" @click="paginate(1)"><Icon name="chevron" :size="16"/></button></div>
           </div>
-          <div v-if="loading&&!activeThread||reading" class="flex flex-1 items-center justify-center gap-3 text-sm text-slate-400"><Icon name="refresh" class="animate-spin"/>正在从 Gmail 加载…</div>
+          <div v-if="loading&&!activeThread||reading" class="flex flex-1 items-center justify-center gap-3 text-sm text-slate-400"><Icon name="refresh" class="animate-spin"/>正在从邮箱加载…</div>
           <div v-else-if="activeThread" class="flex-1 overflow-y-auto px-5 pb-10 sm:px-10"><h1 class="mb-6 mt-8 text-2xl font-medium leading-relaxed">{{messages[0]?.subject||'会话'}}</h1><article v-for="message in messages" :key="message.id" class="mb-5 border-b divider pb-6"><div class="flex items-start gap-3"><span class="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-blue-100 text-sm font-medium text-blue-700 dark:bg-blue-900/40 dark:text-blue-200">{{initials(message.from)}}</span><div class="min-w-0 flex-1"><div class="flex flex-wrap items-center gap-2"><span class="text-sm font-semibold">{{senderName(message.from)}}</span><span class="ml-auto text-xs text-slate-400">{{shortDate(message.date)}}</span><button class="icon-btn !h-8 !w-8" aria-label="切换星标" @click="star(message)"><Icon name="star" :size="17" :class="message.labels.includes('STARRED')?'fill-amber-400 text-amber-400':''"/></button></div><details class="text-xs text-slate-400"><summary class="cursor-pointer truncate">发送至 {{message.to}}</summary><div class="mt-2 space-y-1 break-all rounded-lg bg-slate-50 p-3 dark:bg-slate-800"><p>发件人：{{message.from}}</p><p>收件人：{{message.to}}</p><p v-if="message.cc">抄送：{{message.cc}}</p><p>{{message.date}}</p></div></details></div></div><div class="mt-5 sm:ml-13">                <div v-if="message.html" class="overflow-hidden rounded-xl border border-slate-200/80 bg-white shadow-sm dark:border-slate-700/60">
                   <iframe
                     :key="message.id + '-' + (message.html?.length || 0)"
@@ -308,18 +374,55 @@ onUnmounted(()=>{
   </div>
 
   <div v-if="modal" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4 backdrop-blur-sm" @click.self="modal=''">
-    <section class="surface max-h-[90dvh] w-full max-w-lg overflow-y-auto rounded-3xl p-7 shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="mb-6 flex items-center justify-between"><h2 id="modal-title" class="text-xl font-semibold">{{modal==='connect'?'连接 Gmail 邮箱':modal==='settings'?'账户设置':modal==='label'?'管理标签':'应用标签'}}</h2><button class="icon-btn !h-8 !w-8" aria-label="关闭弹窗" @click="modal=''"><Icon name="close" :size="19"/></button></div>
-      <template v-if="modal==='connect'"><p class="mb-6 text-sm leading-6 text-slate-500">选择连接方式。已连接的邮箱会更新凭据或切换连接方式，邮件保留在 Gmail 中。</p><button class="flex w-full items-center gap-4 rounded-2xl border border-blue-200 bg-blue-50 p-5 text-left dark:border-blue-900 dark:bg-blue-900/20" :disabled="!config.oauthEnabled||connectionBusy" @click="oauthConnect"><span class="flex h-10 w-10 items-center justify-center rounded-full bg-white text-lg font-semibold text-blue-600">G</span><span><span class="block text-sm font-semibold">使用 Google 连接</span><span class="mt-1 block text-xs text-slate-500">OAuth 授权 · 推荐方式</span></span><Icon name="chevron" class="ml-auto" :size="18"/></button><p v-if="!config.oauthEnabled" class="mt-3 text-xs leading-6 text-amber-600">尚未配置 Google OAuth。可在本地环境文件中配置，或使用下方的备选连接。</p><button class="mt-7 flex w-full items-center justify-between text-sm text-slate-500" @click="showImap=!showImap">备选：应用专用密码（IMAP＋SMTP）<Icon name="chevron" :size="16" :class="showImap?'rotate-90':''"/></button><form v-if="showImap" class="mt-5 space-y-4" @submit.prevent="imapConnect"><label class="block text-xs">Gmail 主邮箱地址<input v-model="imap.email" type="email" required class="field mt-2" placeholder="you@gmail.com" autocomplete="email"/></label><label class="block text-xs">Google 应用专用密码<input v-model="imap.password" type="password" required minlength="16" maxlength="64" class="field mt-2" placeholder="16 位应用专用密码" autocomplete="off"/></label><label class="block text-xs">SMTP 加密方式<select v-model.number="imap.port" class="field mt-2"><option :value="465">SSL/TLS · 465（推荐）</option><option :value="587">STARTTLS · 587</option></select></label><p class="text-xs leading-6 text-slate-400">需开启 Google 两步验证并创建应用专用密码。服务器固定为 Gmail，连接时同时验证 IMAP 和 SMTP。<a class="text-blue-600" href="https://support.google.com/accounts/answer/185833?hl=zh-Hans" target="_blank" rel="noopener noreferrer">查看设置方法 ↗</a></p><button class="primary w-full" :disabled="connectionBusy"><Icon v-if="connectionBusy" name="refresh" class="animate-spin" :size="16"/>{{connectionBusy?'正在验证两个通道…':'验证并连接'}}</button></form></template>
-      <template v-else-if="modal==='settings'"><div class="mb-6 flex items-center gap-3 rounded-xl bg-slate-50 p-4 dark:bg-slate-800"><span class="flex h-10 w-10 items-center justify-center rounded-full bg-blue-100 text-blue-700">{{initials(user.username)}}</span><div><p class="text-sm font-semibold">{{user.username}}</p><p class="caption mt-1">Hmail 平台账户</p></div><button class="secondary ml-auto !px-3 !text-xs" @click="logout"><Icon name="logout" :size="14"/>退出</button></div><h3 class="mb-3 text-sm font-medium">已连接邮箱</h3><div v-for="account in accounts" :key="account.id" class="mb-3 flex items-center gap-3 rounded-xl border divider p-3"><div class="min-w-0 flex-1"><p class="truncate text-sm">{{account.email}}</p><p class="caption mt-1">{{account.provider==='oauth'?'Google OAuth':'IMAP＋SMTP'}}</p></div><button class="text-xs text-slate-400 hover:text-red-500" @click="disconnect(account)">断开</button></div><button class="mb-6 text-sm text-blue-600" @click="modal='connect'">＋ 连接另一个邮箱</button><details class="border-t divider pt-4"><summary class="cursor-pointer text-sm">修改密码 / 密保</summary><form class="mt-4 space-y-3" @submit.prevent="changePassword"><input v-model="changingPassword.currentPassword" type="password" required class="field" placeholder="当前密码" autocomplete="current-password"/><input v-model="changingPassword.password" type="password" required minlength="10" class="field" placeholder="新密码（至少 10 个字符）" autocomplete="new-password"/><select v-model="changingPassword.question" class="field"><option value="">保留当前密保</option><option v-for="q in config.questions" :key="q">{{q}}</option></select><input v-if="changingPassword.question" v-model="changingPassword.answer" type="password" minlength="2" required class="field" placeholder="新的密保答案"/><button class="primary" type="submit">保存并重新登录</button></form></details></template>
+    <section class="surface max-h-[90dvh] w-full max-w-lg overflow-y-auto rounded-3xl p-7 shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="mb-6 flex items-center justify-between"><h2 id="modal-title" class="text-xl font-semibold">{{modal==='connect'?'连接邮箱':modal==='settings'?'账户设置':modal==='label'?'管理标签':'应用标签'}}</h2><button class="icon-btn !h-8 !w-8" aria-label="关闭弹窗" @click="modal=''"><Icon name="close" :size="19"/></button></div>
+      <template v-if="modal==='connect'">
+        <p class="mb-6 text-sm leading-6 text-slate-500">选择连接方式。已连接的邮箱会更新凭据或切换连接方式，邮件仍保留在原来的邮箱服务商。</p>
+        <button class="flex w-full items-center gap-4 rounded-2xl border border-blue-200 bg-blue-50 p-5 text-left dark:border-blue-900 dark:bg-blue-900/20" :disabled="!config.oauthEnabled||connectionBusy" @click="oauthConnect"><span class="flex h-10 w-10 items-center justify-center rounded-full bg-white text-lg font-semibold text-blue-600">G</span><span><span class="block text-sm font-semibold">使用 Google 连接</span><span class="mt-1 block text-xs text-slate-500">Gmail OAuth 授权 · 推荐方式</span></span><Icon name="chevron" class="ml-auto" :size="18"/></button>
+        <p v-if="!config.oauthEnabled" class="mt-3 text-xs leading-6 text-amber-600">尚未配置 Google OAuth。可在本地环境文件中配置，或直接使用下方的 IMAP＋SMTP 连接。</p>
+        <div class="mt-7 border-t divider pt-6">
+          <h3 class="text-sm font-medium">使用 IMAP＋SMTP 连接</h3>
+          <p class="mt-2 text-xs leading-6 text-slate-400">支持任意开启 IMAP 与 SMTP 服务的邮箱。选择服务商会自动填充服务器，也可以手动改成自定义服务器。</p>
+          <form class="mt-4 space-y-4" @submit.prevent="imapConnect">
+            <label class="block text-xs">邮箱地址<input v-model="connection.email" type="email" required maxlength="254" class="field mt-2" placeholder="you@example.com" autocomplete="email" @input="detectProvider"/></label>
+            <label class="block text-xs">密码 / 授权码<input v-model="connection.password" type="password" required minlength="1" maxlength="256" class="field mt-2" placeholder="邮箱密码或客户端授权码" autocomplete="off"/></label>
+            <label class="block text-xs">邮箱服务商<select v-model="connection.provider" class="field mt-2" @change="applyPreset(connection.provider)"><option value="">自动识别 / 请选择</option><option v-for="preset in config.mailProviders" :key="preset.id" :value="preset.id">{{preset.name}}</option><option value="custom">自定义 / 其他邮箱</option></select></label>
+            <p v-if="presetHint" class="text-xs leading-6 text-slate-400">{{presetHint}}</p>
+            <div class="rounded-xl border divider p-4">
+              <p class="mb-3 text-xs font-medium text-slate-500">收信服务器（IMAP）</p>
+              <label class="block text-xs">服务器地址<input v-model="connection.imapHost" required maxlength="253" class="field mt-2" placeholder="imap.example.com"/></label>
+              <div class="mt-3 grid grid-cols-2 gap-3">
+                <label class="block text-xs">端口<input v-model.number="connection.imapPort" type="number" min="1" max="65535" required class="field mt-2"/></label>
+                <label class="block text-xs">加密方式<select v-model="connection.imapSecurity" class="field mt-2"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
+              </div>
+            </div>
+            <div class="rounded-xl border divider p-4">
+              <p class="mb-3 text-xs font-medium text-slate-500">发信服务器（SMTP）</p>
+              <label class="block text-xs">服务器地址<input v-model="connection.smtpHost" required maxlength="253" class="field mt-2" placeholder="smtp.example.com"/></label>
+              <div class="mt-3 grid grid-cols-2 gap-3">
+                <label class="block text-xs">端口<input v-model.number="connection.smtpPort" type="number" min="1" max="65535" required class="field mt-2"/></label>
+                <label class="block text-xs">加密方式<select v-model="connection.smtpSecurity" class="field mt-2"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
+              </div>
+            </div>
+            <p class="text-xs leading-6 text-slate-400">连接时会同时验证收信与发信两个通道，任一失败都不会保存。多数邮箱需要先开启 IMAP/SMTP 服务并使用授权码或专用密码。</p>
+            <button class="primary w-full" :disabled="connectionBusy"><Icon v-if="connectionBusy" name="refresh" class="animate-spin" :size="16"/>{{connectionBusy?'正在验证两个通道…':'验证并连接'}}</button>
+          </form>
+        </div>
+      </template>
+      <template v-else-if="modal==='settings'"><div class="mb-6 flex items-center gap-3 rounded-xl bg-slate-50 p-4 dark:bg-slate-800"><span class="flex h-10 w-10 items-center justify-center rounded-full bg-blue-100 text-blue-700">{{initials(user.email)}}</span><div><p class="text-sm font-semibold break-all">{{user.email}}</p><p class="caption mt-1">Hmail 平台账户</p></div><button class="secondary ml-auto !px-3 !text-xs" @click="logout"><Icon name="logout" :size="14"/>退出</button></div><h3 class="mb-3 text-sm font-medium">已连接邮箱</h3><div v-for="account in accounts" :key="account.id" class="mb-3 flex items-center gap-3 rounded-xl border divider p-3"><div class="min-w-0 flex-1"><p class="truncate text-sm">{{account.email}}</p><p class="caption mt-1">{{account.provider==='oauth'?'Google OAuth':'IMAP＋SMTP'}}</p></div><button class="text-xs text-slate-400 hover:text-red-500" @click="disconnect(account)">断开</button></div><button class="mb-6 text-sm text-blue-600" @click="openConnect">＋ 连接另一个邮箱</button><details class="border-t divider pt-4"><summary class="cursor-pointer text-sm">修改密码</summary><form class="mt-4 space-y-3" @submit.prevent="changePassword"><input v-model="changingPassword.currentPassword" type="password" required class="field" placeholder="当前密码" autocomplete="current-password"/><input v-model="changingPassword.password" type="password" required minlength="10" class="field" placeholder="新密码（至少 10 个字符）" autocomplete="new-password"/><p class="text-xs leading-6 text-slate-400">修改密码会撤销所有已登录会话，需要重新登录。</p><button class="primary" type="submit">保存并重新登录</button></form></details></template>
       <form v-else-if="modal==='label'" @submit.prevent="saveLabel"><label class="block text-sm">标签名称<input v-model="labelName" class="field mt-2" required maxlength="200" autofocus/></label><div class="mt-6 flex justify-between"><button v-if="labelEdit" type="button" class="text-sm text-red-500" @click="deleteLabel(labelEdit);modal=''">删除标签</button><button class="primary ml-auto">保存</button></div></form>
       <form v-else @submit.prevent="modify([labelChoice]);modal='' "><select v-model="labelChoice" class="field" required><option value="" disabled>选择标签</option><option v-for="label in customLabels" :key="label.id" :value="label.id">{{label.name}}</option></select><p v-if="!customLabels.length" class="mt-3 text-xs text-slate-400">请先在侧边栏创建标签。</p><div class="mt-5 flex justify-end gap-2"><button type="button" class="secondary" :disabled="!labelChoice" @click="modify([],[labelChoice]);modal=''">移除标签</button><button class="primary" :disabled="!labelChoice">应用</button></div></form>
     </section>
   </div>
 
-  <section v-if="composer" class="surface fixed inset-x-2 bottom-0 z-40 flex max-h-[90dvh] flex-col overflow-hidden rounded-t-2xl border border-slate-200 shadow-[0_0_45px_#00000025] dark:border-slate-700 sm:left-auto sm:right-8 sm:w-[580px]" role="dialog" aria-label="写邮件">
-    <header class="flex items-center justify-between bg-[#eaf0fa] px-5 py-3 dark:bg-slate-800"><h2 class="text-sm font-medium">新邮件</h2><span class="ml-auto mr-3 text-[11px] text-slate-400" aria-live="polite">{{savedState}}</span><button class="text-slate-500" aria-label="保存并关闭" :disabled="composingBusy" @click="closeCompose"><Icon name="close" :size="18"/></button></header>
-    <form class="flex min-h-0 flex-col" @submit.prevent="sendMail"><div class="min-h-0 overflow-y-auto px-5"><div class="border-b divider py-3 text-xs text-slate-400">发件人 <span class="ml-3 text-slate-600 dark:text-slate-300">{{accounts.find(a=>a.id===composeAccount)?.email}}</span></div><label v-for="field in (['to','cc','bcc'] as const)" :key="field" class="flex items-center border-b divider text-sm text-slate-400"><span class="w-14 shrink-0">{{field==='to'?'收件人':field==='cc'?'抄送':'密送'}}</span><input v-model="draft[field]" :disabled="sendUncertain" class="w-full bg-transparent py-3 text-slate-700 focus-visible:ring-0 dark:text-slate-200" :aria-label="field" @input="dirty"/></label><input v-model="draft.subject" :disabled="sendUncertain" class="w-full border-b divider bg-transparent py-3 text-sm focus-visible:ring-0" placeholder="主题" aria-label="邮件主题" @input="dirty"/><textarea v-model="draft.text" :disabled="sendUncertain" class="min-h-[240px] w-full resize-y bg-transparent py-4 text-sm leading-7 focus-visible:ring-0" placeholder="写下你的邮件…" aria-label="邮件正文" @input="dirty"></textarea><div class="mb-3 flex flex-wrap gap-2"><div v-for="(attachment,index) in draft.attachments" :key="attachment.id" class="flex max-w-full items-center gap-2 rounded-lg bg-slate-100 px-3 py-2 text-xs dark:bg-slate-800"><Icon name="attachment" :size="14"/><span class="max-w-[230px] truncate">{{attachment.name}}</span><span class="text-slate-400">{{sizeText(attachment.size)}}</span><button type="button" :disabled="sendUncertain" aria-label="移除附件" @click="draft.attachments.splice(index,1);dirty()"><Icon name="close" :size="13"/></button></div></div></div><p v-if="sendUncertain" class="mx-5 mb-3 rounded-lg bg-amber-50 p-3 text-xs leading-6 text-amber-700">发送结果待确认。请先查看已发送文件夹；此窗口已禁止再次发送。</p><footer class="flex items-center gap-3 border-t divider p-4"><button class="primary" :disabled="composingBusy||uploading||sendUncertain"><Icon name="send" :size="16"/>{{composingBusy?'处理中…':'发送'}}</button><label class="icon-btn cursor-pointer" aria-label="添加附件"><Icon :name="uploading?'refresh':'attachment'" :class="uploading?'animate-spin':''"/><input type="file" multiple class="sr-only" :disabled="uploading||sendUncertain" @change="uploadFiles"/></label><button type="button" class="text-xs text-slate-400" :disabled="composingBusy||sendUncertain" @click="saveDraft">保存草稿</button><button type="button" class="icon-btn ml-auto" :disabled="composingBusy" aria-label="丢弃草稿" @click="discardCompose"><Icon name="trash" :size="18"/></button></footer></form>
-  </section>
+  <ComposeDialog :open="composeVisible" @stash="stashCompose">
+    <header class="flex shrink-0 flex-wrap items-center justify-between gap-y-2 bg-[#eaf0fa] px-5 py-3 dark:bg-slate-800"><h2 class="shrink-0 text-sm font-medium">新邮件</h2><span class="ml-auto mr-3 text-[11px] text-slate-400" aria-live="polite">{{savedState}}</span><button class="mr-3 rounded-lg px-2 py-1 text-xs text-blue-600 dark:text-blue-300" :disabled="composingBusy||uploading" @click="stashCompose">暂存</button><button class="text-slate-500" aria-label="保存并关闭" :disabled="composingBusy||uploading" @click="closeCompose"><Icon name="close" :size="18"/></button></header>
+    <form class="flex min-h-0 flex-1 flex-col" @submit.prevent="sendMail"><div class="min-h-0 overflow-y-auto px-5"><div class="border-b divider py-3 text-xs text-slate-400">发件人 <span class="ml-3 text-slate-600 dark:text-slate-300">{{accounts.find(a=>a.id===composeAccount)?.email}}</span></div><label v-for="field in (['to','cc','bcc'] as const)" :key="field" class="flex items-center border-b divider text-sm text-slate-400"><span class="w-14 shrink-0">{{field==='to'?'收件人':field==='cc'?'抄送':'密送'}}</span><input v-model="draft[field]" :disabled="sendUncertain" class="w-full bg-transparent py-3 text-slate-700 focus-visible:ring-0 dark:text-slate-200" :aria-label="field" @input="dirty"/></label><input v-model="draft.subject" :disabled="sendUncertain" class="w-full border-b divider bg-transparent py-3 text-sm focus-visible:ring-0" placeholder="主题" aria-label="邮件主题" @input="dirty"/><textarea v-model="draft.text" :disabled="sendUncertain" class="min-h-[240px] w-full resize-y bg-transparent py-4 text-sm leading-7 focus-visible:ring-0" placeholder="写下你的邮件…" aria-label="邮件正文" @input="dirty"></textarea><div class="mb-3 flex flex-wrap gap-2"><div v-for="(attachment,index) in draft.attachments" :key="attachment.id" class="flex max-w-full items-center gap-2 rounded-lg bg-slate-100 px-3 py-2 text-xs dark:bg-slate-800"><Icon name="attachment" :size="14"/><span class="max-w-[230px] truncate">{{attachment.name}}</span><span class="text-slate-400">{{sizeText(attachment.size)}}</span><button type="button" :disabled="sendUncertain" aria-label="移除附件" @click="draft.attachments.splice(index,1);dirty()"><Icon name="close" :size="13"/></button></div></div></div><p v-if="sendUncertain" class="mx-5 mb-3 rounded-lg bg-amber-50 p-3 text-xs leading-6 text-amber-700">发送结果待确认。请先查看已发送文件夹；此窗口已禁止再次发送。</p><footer class="flex shrink-0 flex-wrap items-center gap-3 border-t divider p-4"><button class="primary" :disabled="composingBusy||uploading||sendUncertain"><Icon name="send" :size="16"/>{{composingBusy?'处理中…':'发送'}}</button><label class="icon-btn cursor-pointer" aria-label="添加附件"><Icon :name="uploading?'refresh':'attachment'" :class="uploading?'animate-spin':''"/><input type="file" multiple class="sr-only" :disabled="composingBusy||uploading||sendUncertain" @change="uploadFiles"/></label><button type="button" class="text-xs text-slate-400" :disabled="composingBusy||uploading||sendUncertain" @click="saveDraft">保存草稿</button><button type="button" class="icon-btn ml-auto" :disabled="composingBusy||uploading" aria-label="丢弃草稿" @click="discardCompose"><Icon name="trash" :size="18"/></button></footer></form>
+  </ComposeDialog>
+  <button v-if="user && composer && composeStashed" class="compose-stash surface" aria-label="恢复暂存邮件" @click="restoreCompose">
+    <span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-blue-100 text-blue-600 dark:bg-blue-900/40 dark:text-blue-300"><Icon name="edit" :size="19"/></span>
+    <span class="min-w-0 flex-1 text-left"><span class="block truncate text-sm font-medium">{{draft.subject || '未命名邮件'}}</span><span class="mt-1 block truncate text-xs" :class="savedState.includes('失败')?'text-red-500':'text-slate-500 dark:text-slate-400'" aria-live="polite">{{savedState || '已暂存'}} · {{savedState.includes('失败')?'点击恢复并重试':'点击继续编辑'}}</span></span>
+    <Icon name="chevron" class="-rotate-90 text-slate-400" :size="16"/>
+  </button>
   <div v-if="error" role="alert" class="fixed left-1/2 top-4 z-[70] flex w-[calc(100%-2rem)] max-w-xl -translate-x-1/2 items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-800 shadow-lg"><Icon name="alert" class="mt-0.5 shrink-0" :size="18"/><span class="flex-1 leading-6">{{error}}</span><button aria-label="关闭错误提示" @click="error=''"><Icon name="close" :size="17"/></button></div>
   <div v-if="notice" role="status" class="fixed bottom-6 left-1/2 z-[70] flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-xl bg-slate-800 px-5 py-3.5 text-sm text-white shadow-xl"><Icon name="check" :size="17" class="shrink-0 text-emerald-400"/>{{notice}}<button aria-label="关闭提示" @click="notice=''"><Icon name="close" :size="15"/></button></div>
 </template>

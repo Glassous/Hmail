@@ -1,6 +1,14 @@
 @import "tailwindcss";
 @custom-variant dark (&:where(.dark, .dark *));
 @theme { --font-sans: "Inter", "Segoe UI", "Microsoft YaHei", sans-serif; }
+:root { --scroll-thumb: #bcc9dc; --scroll-hover: #889fbf; --scroll-track: #f1f5fa; }
+:root.dark { --scroll-thumb: #52647d; --scroll-hover: #7992b2; --scroll-track: #19212e; }
+* { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: var(--scroll-track); }
+::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border: 2px solid var(--scroll-track); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scroll-hover); }
+@media (forced-colors: active) { * { scrollbar-color: auto; } }
 @layer base {
   body { @apply m-0 bg-[#f6f8fc] text-slate-800 antialiased dark:bg-[#10151e] dark:text-slate-200; }
   button { @apply cursor-pointer disabled:cursor-not-allowed disabled:opacity-40; }
@@ -16,4 +24,15 @@
   .surface { @apply bg-white dark:bg-[#19212e]; }
   .divider { @apply border-slate-100 dark:border-slate-700/70; }
   .caption { @apply text-xs text-slate-400; }
+  .mailbox-picker { @apply relative z-20 mb-4 h-[88px] shrink-0; }
+  .mailbox-card { @apply absolute inset-x-0 top-0 overflow-hidden rounded-2xl border border-slate-200/80 dark:border-slate-700/70; transform-origin: top center; }
+  .mailbox-card.is-open { @apply shadow-xl shadow-slate-900/10 dark:shadow-black/30; }
+  .mailbox-trigger { @apply flex w-full items-center justify-between px-3 pb-1 pt-3 text-[11px] font-medium text-slate-400; }
+  .mailbox-options { @apply max-h-[min(320px,40dvh)] overflow-y-auto overscroll-contain p-1.5; }
+  .mailbox-option { @apply flex w-full items-center gap-2 rounded-xl px-2 py-2 text-left text-xs font-medium text-slate-600 hover:bg-blue-50 dark:text-slate-200 dark:hover:bg-slate-800; }
+  .mailbox-option.is-selected { @apply bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-200; }
+  .mailbox-avatar { @apply flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-blue-100 text-xs text-blue-700 dark:bg-blue-900/50 dark:text-blue-200; }
+  .compose-overlay { @apply fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/35 p-3 backdrop-blur-md dark:bg-black/50 sm:p-6; }
+  .compose-dialog { @apply flex max-h-[90dvh] w-full max-w-[720px] flex-col overflow-hidden rounded-3xl border border-slate-200 shadow-2xl dark:border-slate-700; }
+  .compose-stash { @apply fixed bottom-4 right-4 z-40 flex w-[320px] max-w-[calc(100vw-2rem)] items-center gap-3 rounded-2xl border border-blue-200 p-3 shadow-xl shadow-slate-900/10 transition hover:border-blue-400 dark:border-slate-600 dark:shadow-black/30; }
 }

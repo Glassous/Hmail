@@ -1,6 +1,7 @@
+import hashlib
+import hmac
 import json
 import os
-import unicodedata
 import uuid
 from datetime import datetime, timezone
 
@@ -16,7 +17,14 @@ GOOGLE_ID = os.getenv('GOOGLE_CLIENT_ID', '')
 GOOGLE_SECRET = os.getenv('GOOGLE_CLIENT_SECRET', '')
 REDIRECT_URI = PUBLIC_URL + '/api/v1/gmail-accounts/oauth/callback'
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
-QUESTIONS = ['你小时候最喜欢的书是什么？', '你自定义的秘密短语是什么？', '你第一次旅行的目的地是哪里？', '你最喜欢的虚构角色是谁？']
+SMTP_HOST = os.getenv('SMTP_HOST', 'smtp.qq.com')
+SMTP_PORT = int(os.getenv('SMTP_PORT', '465'))
+SMTP_USER = os.getenv('SMTP_USER', '')
+SMTP_PASS = os.getenv('SMTP_PASS', '')
+SMTP_FROM = os.getenv('SMTP_FROM', '') or SMTP_USER
+EMAIL_CODE_TTL = 600
+EMAIL_CODE_COOLDOWN = 60
+EMAIL_CODE_MAX_TRIES = 5
 engine = create_engine(os.getenv('DATABASE_URL', 'sqlite:///./test.db'), pool_pre_ping=True)
 Session = sessionmaker(engine, expire_on_commit=False)
 cache = Redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379/0'), decode_responses=True, socket_timeout=5, socket_connect_timeout=5)
@@ -34,10 +42,8 @@ def uid():
 class User(Base):
     __tablename__ = 'users'
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    username: Mapped[str] = mapped_column(String(40), unique=True)
+    email: Mapped[str] = mapped_column(String(254), unique=True)
     password_hash: Mapped[str] = mapped_column(Text)
-    question: Mapped[str] = mapped_column(String(200))
-    answer_hash: Mapped[str] = mapped_column(Text)
     session_version: Mapped[int] = mapped_column(Integer, default=1)
     theme: Mapped[str] = mapped_column(String(10), default='system')
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -62,8 +68,8 @@ def decrypt(data):
     return json.loads(Fernet(os.environ['TOKEN_ENCRYPTION_KEY']).decrypt(data.encode()))
 
 
-def normalize_answer(answer):
-    return unicodedata.normalize('NFKC', answer.strip())
+def normalize_email(email):
+    return email.strip().lower()
 
 
 def canonical_email(email):
@@ -79,3 +85,31 @@ def verify(value, hashed):
         return passwords.verify(hashed, value)
     except (VerificationError, InvalidHashError):
         return False
+
+
+CODE_KEY = hashlib.sha256((os.environ.get('TOKEN_ENCRYPTION_KEY', 'hmail-token-key-default') + ':email-code').encode()).digest()
+
+
+def code_digest(code):
+    return hmac.new(CODE_KEY, code.encode('utf-8'), hashlib.sha256).hexdigest()
+
+
+def store_code(purpose, email, code):
+    cache.setex(f'code:{purpose}:{email}', EMAIL_CODE_TTL, code_digest(code))
+
+
+def consume_code(purpose, email, code):
+    key, tries_key = f'code:{purpose}:{email}', f'code-tries:{purpose}:{email}'
+    stored = cache.get(key)
+    if not stored:
+        return False
+    tries = cache.incr(tries_key)
+    cache.expire(tries_key, EMAIL_CODE_TTL)
+    if tries > EMAIL_CODE_MAX_TRIES:
+        cache.delete(key)
+        return False
+    if not hmac.compare_digest(stored, code_digest(code)):
+        return False
+    cache.delete(key)
+    cache.delete(tries_key)
+    return True

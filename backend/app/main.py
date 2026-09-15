@@ -4,6 +4,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import smtplib
 import socket
@@ -28,8 +29,10 @@ from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from .core import *
+from .emailer import send_code as send_code_mail, smtp_configured
 from .mail import MailError, MAX_ATTACHMENT, build_message, recipients, safe_html, sign_url, verify_url_sig, b64, unb64
-from .providers import GmailApiProvider, GmailImapSmtpProvider
+from .presets import MAIL_PRESETS
+from .providers import GmailApiProvider, ImapSmtpProvider
 
 app = FastAPI(title='Hmail API', version='1.0.0', docs_url=None, redoc_url=None, openapi_url='/api/openapi.json')
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -104,7 +107,7 @@ def current_user(request: Request):
 
 
 def public_user(user):
-    return {'id': user.id, 'username': user.username, 'theme': user.theme}
+    return {'id': user.id, 'email': user.email, 'theme': user.theme}
 
 
 def make_session(user, response, old=''):
@@ -116,29 +119,32 @@ def make_session(user, response, old=''):
     return {'user': public_user(user), 'csrf': csrf}
 
 
-class Login(BaseModel):
-    username: str = Field(min_length=3, max_length=40, pattern=r'^[a-zA-Z0-9_-]+$')
+class Credentials(BaseModel):
+    email: str = Field(min_length=3, max_length=254, pattern=r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
     password: str = Field(min_length=10, max_length=128)
 
-    @field_validator('username')
+    @field_validator('email')
     @classmethod
     def canonical(cls, value):
-        return value.lower()
+        return normalize_email(value)
 
 
-class Register(Login):
-    question: str
-    answer: str = Field(min_length=2, max_length=200)
+class EmailCode(BaseModel):
+    email: str = Field(min_length=3, max_length=254, pattern=r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+    purpose: Literal['register', 'reset']
+
+    @field_validator('email')
+    @classmethod
+    def canonical(cls, value):
+        return normalize_email(value)
 
 
-class Recovery(BaseModel):
-    username: str = Field(min_length=3, max_length=40)
-    answer: str = Field(min_length=2, max_length=200)
+class Register(Credentials):
+    code: str = Field(min_length=6, max_length=6, pattern=r'^\d{6}$')
 
 
-class Reset(BaseModel):
-    token: str = Field(min_length=20, max_length=100)
-    password: str = Field(min_length=10, max_length=128)
+class Reset(Credentials):
+    code: str = Field(min_length=6, max_length=6, pattern=r'^\d{6}$')
 
 
 @app.get(PREFIX + '/health')
@@ -162,31 +168,57 @@ def api_docs():
 
 @app.get(PREFIX + '/config')
 def config():
-    return {'oauthEnabled': bool(GOOGLE_ID and GOOGLE_SECRET), 'questions': QUESTIONS, 'maxAttachmentBytes': MAX_ATTACHMENT}
+    return {'oauthEnabled': bool(GOOGLE_ID and GOOGLE_SECRET), 'emailCodeEnabled': smtp_configured(), 'maxAttachmentBytes': MAX_ATTACHMENT, 'mailProviders': MAIL_PRESETS}
+
+
+@app.post(PREFIX + '/auth/send-code')
+def send_code(data: EmailCode, request: Request):
+    limited(request, 'send-code', data.email, 5, 3600)
+    with Session() as db:
+        exists = db.scalar(select(User.id).where(User.email == data.email)) is not None
+    if data.purpose == 'register' and exists:
+        raise MailError('该邮箱已注册，请直接登录或重置密码', 'conflict', 409)
+    if not cache.set(f'code-cooldown:{data.purpose}:{data.email}', '1', nx=True, ex=EMAIL_CODE_COOLDOWN):
+        raise MailError('验证码发送过于频繁，请稍后再试', 'rate_limit', 429)
+    # 重置密码时账号不存在也返回成功，避免暴露邮箱注册状态。
+    if data.purpose == 'reset' and not exists:
+        return {'ok': True, 'cooldown': EMAIL_CODE_COOLDOWN}
+    code = f'{secrets.randbelow(1000000):06d}'
+    store_code(data.purpose, data.email, code)
+    try:
+        send_code_mail(data.email, code, data.purpose)
+    except MailError:
+        cache.delete(f'code:{data.purpose}:{data.email}')
+        cache.delete(f'code-cooldown:{data.purpose}:{data.email}')
+        raise
+    return {'ok': True, 'cooldown': EMAIL_CODE_COOLDOWN}
 
 
 @app.post(PREFIX + '/auth/register')
 def register(data: Register, request: Request, response: Response):
-    limited(request, 'register', data.username, 10)
-    if data.question not in QUESTIONS or len(normalize_answer(data.answer)) < 2:
-        raise MailError('请选择密保问题并填写至少两个字符的答案', 'validation', 422)
-    user = User(username=data.username, password_hash=passwords.hash(data.password), question=data.question, answer_hash=passwords.hash(normalize_answer(data.answer)))
+    limited(request, 'register', data.email, 10)
+    with Session() as db:
+        if db.scalar(select(User.id).where(User.email == data.email)):
+            raise MailError('该邮箱已被注册', 'conflict', 409)
+    if not consume_code('register', data.email, data.code):
+        raise MailError('验证码不正确或已过期，请重新获取', 'code_invalid', 422)
+    user = User(email=data.email, password_hash=passwords.hash(data.password))
     with Session() as db:
         db.add(user)
         try:
             db.commit()
         except IntegrityError:
-            raise MailError('用户名已被使用', 'conflict', 409) from None
+            raise MailError('该邮箱已被注册', 'conflict', 409) from None
     return make_session(user, response, request.cookies.get('hmail_session'))
 
 
 @app.post(PREFIX + '/auth/login')
-def login(data: Login, request: Request, response: Response):
-    limited(request, 'login', data.username)
+def login(data: Credentials, request: Request, response: Response):
+    limited(request, 'login', data.email)
     with Session() as db:
-        user = db.scalar(select(User).where(User.username == data.username))
+        user = db.scalar(select(User).where(User.email == data.email))
     if not verify(data.password, user.password_hash if user else DUMMY_HASH) or not user:
-        raise MailError('用户名或密码不正确', 'credentials', 401)
+        raise MailError('邮箱或密码不正确', 'credentials', 401)
     return make_session(user, response, request.cookies.get('hmail_session'))
 
 
@@ -197,40 +229,19 @@ def logout(request: Request, response: Response, user=Depends(current_user)):
     return {'ok': True}
 
 
-@app.get(PREFIX + '/auth/recovery-question')
-def recovery_question(username: str, request: Request):
-    limited(request, 'question', username.lower(), 10)
-    with Session() as db:
-        user = db.scalar(select(User).where(User.username == username.lower()))
-    # A stable decoy avoids directly reporting whether an account exists.
-    return {'question': user.question if user else QUESTIONS[int(hashlib.sha256(username.lower().encode()).hexdigest(), 16) % len(QUESTIONS)]}
-
-
-@app.post(PREFIX + '/auth/recover')
-def recover(data: Recovery, request: Request):
-    limited(request, 'recover', data.username.lower(), 5, 3600)
-    with Session() as db:
-        user = db.scalar(select(User).where(User.username == data.username.lower()))
-    if not verify(normalize_answer(data.answer), user.answer_hash if user else DUMMY_HASH) or not user:
-        raise MailError('账户或密保答案不正确', 'credentials', 400)
-    token = secrets.token_urlsafe(32)
-    cache.setex('reset:' + token, 300, json.dumps({'user': user.id, 'version': user.session_version}))
-    return {'token': token}
-
-
 @app.post(PREFIX + '/auth/reset')
 def reset(data: Reset, request: Request):
-    limited(request, 'reset', maximum=10)
-    value = cache.getdel('reset:' + data.token)
-    if not value:
-        raise MailError('重设凭证已过期或使用，请重新验证密保', 'expired', 400)
-    info = json.loads(value)
+    limited(request, 'reset', data.email, 10)
     with Session() as db:
-        user = db.scalar(select(User).where(User.id == info['user']).with_for_update())
-        if not user or user.session_version != info['version']:
-            raise MailError('重设凭证已失效', 'expired', 400)
-        user.password_hash = passwords.hash(data.password)
-        user.session_version += 1
+        user = db.scalar(select(User).where(User.email == data.email))
+    if not user:
+        raise MailError('该邮箱尚未注册', 'not_found', 404)
+    if not consume_code('reset', data.email, data.code):
+        raise MailError('验证码不正确或已过期，请重新获取', 'code_invalid', 422)
+    with Session() as db:
+        stored = db.get(User, user.id)
+        stored.password_hash = passwords.hash(data.password)
+        stored.session_version += 1
         db.commit()
     return {'ok': True}
 
@@ -256,8 +267,6 @@ def preferences(data: Preferences, user=Depends(current_user)):
 class PasswordChange(BaseModel):
     currentPassword: str
     password: str = Field(min_length=10, max_length=128)
-    question: str | None = None
-    answer: str | None = Field(default=None, min_length=2, max_length=200)
 
 
 @app.post(PREFIX + '/me/password')
@@ -268,10 +277,6 @@ def password_change(data: PasswordChange, request: Request, user=Depends(current
     with Session() as db:
         stored = db.get(User, user.id)
         stored.password_hash = passwords.hash(data.password)
-        if data.question is not None:
-            if data.question not in QUESTIONS or not data.answer or len(normalize_answer(data.answer)) < 2:
-                raise MailError('密保信息不完整', 'validation', 422)
-            stored.question, stored.answer_hash = data.question, passwords.hash(normalize_answer(data.answer))
         stored.session_version += 1
         db.commit()
     return {'ok': True}
@@ -309,7 +314,7 @@ def provider_for(user, aid):
                 row = db.get(Account, aid)
                 row.secret = encrypt(value)
                 db.commit()
-        cls = GmailApiProvider if account.provider == 'oauth' else GmailImapSmtpProvider
+        cls = GmailApiProvider if account.provider == 'oauth' else ImapSmtpProvider
         provider = cls(account.email, decrypt(account.secret), save_secret)
         yield provider, account
     except (RefreshError, imaplib.IMAP4.error, smtplib.SMTPAuthenticationError):
@@ -318,9 +323,9 @@ def provider_for(user, aid):
             if row:
                 row.status = 'reconnect'
                 db.commit()
-        raise MailError('邮箱连接已失效，请重新授权或更新应用专用密码', 'reconnect', 401) from None
+        raise MailError('邮箱连接已失效，请重新连接或更新密码/授权码', 'reconnect', 401) from None
     except (TimeoutError, OSError):
-        raise MailError('连接 Gmail 超时，请检查网络后重试', 'network', 502) from None
+        raise MailError('连接邮箱超时，请检查网络后重试', 'network', 502) from None
     finally:
         if provider:
             provider.close()
@@ -362,26 +367,72 @@ def accounts(user=Depends(current_user)):
         return [account_view(a) for a in db.scalars(select(Account).where(Account.user_id == user.id))]
 
 
+HOST_PATTERN = re.compile(r'^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$')
+
+
+def clean_mailbox_host(value):
+    host = value.strip().rstrip('.')
+    if not HOST_PATTERN.match(host):
+        raise MailError('邮件服务器地址格式不正确，请检查后重试', 'validation', 422)
+    return host.lower()
+
+
+def guard_mailbox_host(host):
+    """Resolve the host and refuse cloud metadata / link-local targets."""
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise MailError('无法解析邮件服务器地址，请检查后重试', 'dns_error', 502) from None
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+            raise MailError('禁止连接受限的邮件服务器地址', 'ssrf_blocked', 403)
+
+
 class ImapConnect(BaseModel):
     email: str = Field(min_length=3, max_length=254, pattern=r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
-    password: str = Field(min_length=16, max_length=64)
-    port: Literal[465, 587] = 465
+    password: str = Field(min_length=1, max_length=256)
+    imapHost: str = Field(min_length=1, max_length=253)
+    imapPort: int = Field(ge=1, le=65535)
+    imapSecurity: Literal['ssl', 'starttls']
+    smtpHost: str = Field(min_length=1, max_length=253)
+    smtpPort: int = Field(ge=1, le=65535)
+    smtpSecurity: Literal['ssl', 'starttls']
+
+    @field_validator('email')
+    @classmethod
+    def canonical(cls, value):
+        return normalize_email(value)
 
 
 @app.post(PREFIX + '/gmail-accounts/imap')
 def connect_imap(data: ImapConnect, request: Request, user=Depends(current_user)):
     limited(request, 'connect', user.id, 10)
-    secret = {'password': data.password.replace(' ', ''), 'port': data.port}
+    password = data.password.strip()
+    if password.count(' ') == 3 and len(password.replace(' ', '')) == 16:
+        # Google 应用专用密码常以 4 位一组显示，去掉分组空格后再使用。
+        password = password.replace(' ', '')
+    imap_host, smtp_host = clean_mailbox_host(data.imapHost), clean_mailbox_host(data.smtpHost)
+    guard_mailbox_host(imap_host)
+    guard_mailbox_host(smtp_host)
+    secret = {
+        'password': password,
+        'imap': {'host': imap_host, 'port': data.imapPort, 'security': data.imapSecurity},
+        'smtp': {'host': smtp_host, 'port': data.smtpPort, 'security': data.smtpSecurity},
+    }
     provider = None
     try:
-        provider = GmailImapSmtpProvider(canonical_email(data.email), secret)
+        provider = ImapSmtpProvider(canonical_email(data.email), secret)
         provider.validate()
-        # Gmail returns the authenticated primary account in its ID response where available.
-        # Require the supplied full mailbox address; aliases must be connected via OAuth.
     except (imaplib.IMAP4.error, smtplib.SMTPAuthenticationError):
-        raise MailError('认证失败，请使用 Gmail 主邮箱地址与应用专用密码，并确认账户允许 IMAP/SMTP', 'credentials', 400) from None
-    except (OSError, smtplib.SMTPException):
-        raise MailError('无法连接 Gmail，请检查网络或稍后再试', 'network', 502) from None
+        raise MailError('认证失败，请检查邮箱地址与密码/授权码，并确认邮箱已开启 IMAP 与 SMTP 服务', 'credentials', 400) from None
+    except smtplib.SMTPException:
+        raise MailError('无法连接发信服务器，请检查 SMTP 主机、端口与加密方式', 'network', 502) from None
+    except (OSError, TimeoutError):
+        raise MailError('无法连接邮件服务器，请检查网络与服务器配置', 'network', 502) from None
     finally:
         if provider:
             provider.close()

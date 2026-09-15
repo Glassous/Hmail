@@ -90,6 +90,11 @@ POSTGRES_PASSWORD=<高强度随机数据库密码>
 TOKEN_ENCRYPTION_KEY=<Fernet加密密钥>
 GOOGLE_CLIENT_ID=<生产OAuth客户端ID>
 GOOGLE_CLIENT_SECRET=<生产OAuth客户端密钥>
+SMTP_HOST=smtp.example.com
+SMTP_PORT=465
+SMTP_USER=<用于发送验证码的邮箱账号>
+SMTP_PASS=<该邮箱的SMTP授权码>
+SMTP_FROM="Hmail <no-reply@example.com>"
 PUBLIC_URL=https://mail.example.com
 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ```
@@ -97,8 +102,9 @@ PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 说明：
 
 - `POSTGRES_PASSWORD`：只用于生产数据库。数据库初始化后不能只修改环境变量，修改密码时必须同时更新数据库账户。
-- `TOKEN_ENCRYPTION_KEY`：加密 OAuth 令牌和 Gmail 应用专用密码。丢失后无法恢复已有邮箱连接。
+- `TOKEN_ENCRYPTION_KEY`：加密 OAuth 令牌与 IMAP/SMTP 邮箱密码或授权码，同时参与验证码摘要计算。丢失后无法恢复已有邮箱连接，且已发送的验证码全部失效。
 - `GOOGLE_CLIENT_ID` 和 `GOOGLE_CLIENT_SECRET`：必须来自生产 Google Cloud 项目。
+- `SMTP_HOST`、`SMTP_PORT`、`SMTP_USER`、`SMTP_PASS`、`SMTP_FROM`：平台账户注册与找回密码的验证码发信通道。`SMTP_PORT` 为 `465` 时使用 SSL/TLS，其他端口使用 STARTTLS；`SMTP_PASS` 通常是邮箱服务商提供的授权码而非登录密码。缺失任一必填项时，公开配置中的 `emailCodeEnabled` 为 `false`，注册与找回密码不可用。
 - `PUBLIC_URL`：必须是用户实际访问的 HTTPS 来源，不带结尾 `/`。
 - `PIP_INDEX_URL`：后端镜像构建使用的 Python 包索引，可根据生产网络调整。
 
@@ -122,7 +128,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 - 设置容器自动重启与健康检查。
 - 在启动 API 前运行数据库迁移。
 - 定期备份 PostgreSQL，并演练恢复过程。
-- 日志不得记录密码、密保答案、OAuth 令牌、应用专用密码和邮件正文。
+- 日志不得记录密码、邮箱验证码、OAuth 令牌、邮箱密码或授权码和邮件正文。
 
 典型启动命令：
 
@@ -269,7 +275,7 @@ https://www.googleapis.com/auth/gmail.modify
 
 - 登录地址。
 - 可使用的平台测试账号。
-- 密保或其他登录步骤。
+- 邮箱验证码或其他登录步骤。
 - 每个权限对应功能的具体入口。
 - 必要的 Gmail 测试数据和操作说明。
 
@@ -309,9 +315,9 @@ Google 会在受限权限验证过程中告知何时启动安全评估。费用�
 - 依赖漏洞扫描、镜像扫描和常规升级流程。
 - 按 Google 品牌规范实现授权按钮和应用品牌。
 - 审核专用环境、测试账号、操作说明和演示视频。
-- 比单个密保问题更可靠的公开账户找回方案，例如已验证邮箱、恢复码或多因素认证。
+- 比邮箱验证码更抗攻击的公开账户找回与登录方案，例如多因素认证和恢复码；并对验证码接口增加更严格的限流与防刷策略。
 
-IMAP＋SMTP 应用专用密码虽然不经过本项目的 Google OAuth 同意页面，但属于高价值长期凭据。正式公开提供该入口前，需要在隐私政策中明确披露，并采用与 OAuth 令牌同等级别的加密、访问控制、撤销和删除措施。也应评估是否只在自托管或管理员允许的环境中开放该备选功能。
+通用 IMAP＋SMTP 的邮箱密码或授权码虽然不经过本项目的 Google OAuth 同意页面，但属于高价值长期凭据。正式公开提供该入口前，需要在隐私政策中明确披露，并采用与 OAuth 令牌同等级别的加密、访问控制、撤销和删除措施。也应评估是否只在自托管或管理员允许的环境中开放该连接方式。
 
 ## 14. 上线检查表
 

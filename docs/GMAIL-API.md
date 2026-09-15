@@ -7,7 +7,27 @@
 - [完整 Gmail API REST 参考](https://developers.google.com/workspace/gmail/api/reference/rest)
 - [Gmail IMAP 扩展](https://developers.google.com/workspace/gmail/imap/imap-extensions)
 
-OAuth 模式请求 `https://www.googleapis.com/auth/gmail.modify`，后端通过 `users/me` 调用 Gmail。IMAP/SMTP 模式以应用专用密码认证，不调用 Gmail REST API。
+OAuth 模式请求 `https://www.googleapis.com/auth/gmail.modify`，后端通过 `users/me` 调用 Gmail。通用 IMAP＋SMTP 模式使用 Python 标准库 `imaplib`/`smtplib`，只走标准协议，不依赖任何厂商扩展，也不调用 Gmail REST API。
+
+## 通用 IMAP/SMTP 连接
+
+任意开启 IMAP 与 SMTP 的邮箱都可连接。服务器、端口与加密方式由用户填写，或由服务商预置项自动填充（`backend/app/presets.py`，经 `GET /api/v1/config` 的 `mailProviders` 下发）。
+
+连接时分别完成 IMAP 登录与 SMTP 登录，任一失败都不保存账号；验证过程不发送邮件。
+
+能力探测与降级：
+
+| 服务端能力 | 用途 | 缺失时的降级 |
+|---|---|---|
+| RFC 6154 特殊用途邮箱 | 识别已发送/草稿/回收站/垃圾邮件/归档 | 按常见文件夹名匹配，仍缺失时相应入口不可用 |
+| `\All` 或 `\Archive` 文件夹 | 归档（从收件箱移出） | 两者都没有时提示不支持归档 |
+| `MOVE`（RFC 6851） | 移动邮件 | `COPY` + `STORE \Deleted` + `EXPUNGE` |
+| `UIDPLUS` | 定向 `UID EXPUNGE`、`APPENDUID` 定位草稿 | 退化为整体 `EXPUNGE`；草稿按 `Message-ID` 搜索定位 |
+| `UIDVALIDITY` | 校验邮件标识是否仍有效 | 必需，变化时提示刷新 |
+
+邮件标识为不透明的 `base64(JSON([文件夹, UIDVALIDITY, UID]))`，会话标识在其中附加会话键与锚点 UID。搜索使用标准 `SEARCH`：`from:`/`to:`/`subject:` 映射为 `HEADER` 条件，其余关键词按 `TEXT` 匹配；优先 `CHARSET UTF-8`，服务端拒绝时回退为 ASCII。
+
+发送成功后会把副本 `APPEND` 到已发送文件夹；该步骤失败不影响发送结论，仅在响应中返回 `warning`。
 
 ## 已接入日常功能
 
@@ -44,13 +64,13 @@ OAuth 模式请求 `https://www.googleapis.com/auth/gmail.modify`，后端通过
 | 路径 | 方法 | 用途 |
 |---|---|---|
 | /health、/config | GET | 连通性、公开功能配置 |
-| /auth/register、/auth/login、/auth/logout | POST | 平台会话 |
-| /auth/recovery-question | GET | 获取密保题目 |
-| /auth/recover、/auth/reset | POST | 验证答案、一次性密码重设 |
+| /auth/send-code | POST | 向注册邮箱发送注册或重置密码验证码 |
+| /auth/register、/auth/login、/auth/logout | POST | 邮箱注册、登录、退出 |
+| /auth/reset | POST | 邮箱验证码重设密码，撤销全部会话 |
 | /me | GET、PATCH | 当前账户、主题偏好 |
-| /me/password | POST | 修改密码及可选密保，撤销会话 |
-| /gmail-accounts | GET | 当前用户的 Gmail 绑定 |
-| /gmail-accounts/imap | POST | 验证 IMAP/SMTP 并绑定 |
+| /me/password | POST | 修改密码，撤销会话 |
+| /gmail-accounts | GET | 当前用户的邮箱绑定 |
+| /gmail-accounts/imap | POST | 验证通用 IMAP/SMTP 并绑定 |
 | /gmail-accounts/oauth/start | POST | 创建一次性 OAuth 状态 |
 | /gmail-accounts/oauth/callback | GET | 接收 Google 授权回调 |
 | /gmail-accounts/{aid} | DELETE | 解除绑定 |
