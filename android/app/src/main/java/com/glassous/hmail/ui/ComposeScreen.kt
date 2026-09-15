@@ -10,7 +10,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -26,11 +25,11 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.glassous.hmail.ApiFailure
-import com.glassous.hmail.MailIcon
 import com.glassous.hmail.MailModel
 import com.glassous.hmail.sizeText
 import com.glassous.hmail.str
 import com.glassous.hmail.ui.common.ConfirmDialog
+import com.glassous.hmail.ui.common.GlassAction
 import com.glassous.hmail.ui.common.HmailField
 import com.glassous.hmail.ui.common.MailPage
 import com.glassous.hmail.ui.common.PrimaryAction
@@ -81,12 +80,9 @@ fun ComposeScreen(model: MailModel, onBack: () -> Unit, onOpenSent: () -> Unit) 
         title = "写邮件",
         onBack = onBack,
         progress = model.busy,
-        actions = {
-            IconButton(
-                onClick = { if (enabled && !model.busy) pendingDiscard = true },
-                enabled = enabled && !model.busy
-            ) { MailIcon("trash", contentDescription = "丢弃草稿") }
-        }
+        actions = listOf(
+            GlassAction("丢弃草稿", "trash", enabled = enabled && !model.busy) { pendingDiscard = true }
+        )
     ) {
         val accountEmail = model.accounts.find { it.id == state.account }?.email ?: ""
         SectionText(accountEmail, size = 14f, muted = true)

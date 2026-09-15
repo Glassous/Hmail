@@ -46,7 +46,6 @@ import com.glassous.hmail.shortDate
 import com.glassous.hmail.str
 import com.glassous.hmail.ui.common.GlassAction
 import com.glassous.hmail.ui.common.GlassTopBar
-import com.glassous.hmail.ui.common.SecondaryAction
 import com.glassous.hmail.ui.common.TopBarExpandedHeight
 import com.glassous.hmail.ui.common.TopBarTopGap
 import com.glassous.hmail.ui.common.bottomInset
@@ -144,10 +143,10 @@ fun InboxScreen(
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize().glassSource(backdrop),
-            // 顶部留白按展开态高度保留，首条邮件不会被展开的玻璃挡住。
+            // 顶部留白按展开态高度保留，首条邮件不会被展开的玻璃挡住；底部为悬浮区（含草稿入口）让位。
             contentPadding = PaddingValues(
                 top = barTop + TopBarExpandedHeight + BlockGap,
-                bottom = bottom + BottomClusterHeight + 16.dp
+                bottom = bottom + BottomClusterHeight + (if (model.hasDraft) FabHeight + BlockGap else 0.dp) + 16.dp
             )
         ) {
             val activeAccount = model.accounts.find { it.id == model.active }
@@ -165,13 +164,6 @@ fun InboxScreen(
                         color = MaterialTheme.colorScheme.error,
                         fontSize = 14.sp
                     )
-                }
-            }
-            if (model.compose != null) {
-                item("resume") {
-                    Box(Modifier.padding(horizontal = 20.dp, vertical = 4.dp)) {
-                        SecondaryAction("继续写信") { onCompose() }
-                    }
                 }
             }
             items(mails, key = { it.threadId }) { mail ->
@@ -251,6 +243,20 @@ fun InboxScreen(
             horizontalAlignment = Alignment.End,
             verticalArrangement = Arrangement.spacedBy(BlockGap)
         ) {
+            // 有未完成草稿时，在"写邮件"上方再加一块玻璃入口。
+            if (model.hasDraft) {
+                GlassPill(
+                    backdrop = backdrop,
+                    modifier = Modifier.height(FabHeight),
+                    onClick = onCompose
+                ) {
+                    Text(
+                        "继续写信",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onBackground
+                    )
+                }
+            }
             GlassPill(
                 backdrop = backdrop,
                 modifier = Modifier.height(FabHeight),

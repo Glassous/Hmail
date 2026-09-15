@@ -2,45 +2,31 @@ package com.glassous.hmail.ui
 
 import android.util.Patterns
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import com.glassous.hmail.MailIcon
 import com.glassous.hmail.MailModel
 import com.glassous.hmail.R
 import com.glassous.hmail.obj
 import com.glassous.hmail.ui.common.HmailField
+import com.glassous.hmail.ui.common.MailPage
 import com.glassous.hmail.ui.common.PrimaryAction
 import com.glassous.hmail.ui.common.SecondaryAction
 import com.glassous.hmail.ui.common.SplitRow
 import com.glassous.hmail.ui.common.TextAction
-import com.glassous.hmail.ui.common.bottomInset
-import com.glassous.hmail.ui.common.topInset
 import kotlinx.coroutines.delay
 
 @Composable
@@ -113,79 +99,65 @@ fun AuthScreen(model: MailModel, mode: String, onNavigate: (String) -> Unit) {
         }
     }
 
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        if (mode == "login") {
-            Spacer(Modifier.height(topInset()))
-        } else {
-            Spacer(Modifier.height(topInset()))
-            Row(
-                modifier = Modifier.fillMaxWidth().height(64.dp).padding(horizontal = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(onClick = { onNavigate(Routes.Login) }) { MailIcon("back", contentDescription = "返回") }
-                Text(title, style = MaterialTheme.typography.titleLarge)
-            }
+    // 登录页没有顶部栏（顶栏标题即提交按钮文案），注册/重设沿用统一的悬浮玻璃顶栏。
+    MailPage(
+        title = if (mode == "login") null else title,
+        onBack = if (mode == "login") null else ({ onNavigate(Routes.Login) }),
+        progress = model.busy,
+        horizontalPadding = side,
+        bottomPadding = 40.dp,
+        contentArrangement = Arrangement.Bottom
+    ) {
+        Image(
+            painter = painterResource(R.drawable.hmail),
+            contentDescription = "Hmail",
+            modifier = Modifier.size(80.dp)
+        )
+        Spacer(Modifier.height(32.dp))
+        HmailField(
+            value = email,
+            onValueChange = { email = it; values["email"] = it; emailError = null },
+            label = "邮箱地址",
+            keyboardType = KeyboardType.Email,
+            isError = emailError != null,
+            errorText = emailError
+        )
+        HmailField(
+            value = password,
+            onValueChange = { password = it; passwordError = null },
+            label = if (mode == "login") "密码" else "新密码",
+            password = true,
+            isError = passwordError != null,
+            errorText = passwordError
+        )
+        if (mode != "login") {
+            HmailField(
+                value = code,
+                onValueChange = { input -> code = input.filter { it.isDigit() }.take(6); codeError = null },
+                label = "验证码",
+                keyboardType = KeyboardType.Number,
+                isError = codeError != null,
+                errorText = codeError
+            )
+            Spacer(Modifier.height(8.dp))
+            SecondaryAction(
+                title = if (remaining > 0) "$remaining 秒后重发" else "获取验证码",
+                enabled = !model.busy && remaining == 0L && codeEnabled,
+                onClick = sendCode
+            )
         }
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .imePadding()
-                .verticalScroll(rememberScrollState())
-                .padding(start = side, end = side, top = 24.dp, bottom = 40.dp + bottomInset()),
-            verticalArrangement = Arrangement.Bottom
-        ) {
-            Image(
-                painter = painterResource(R.drawable.hmail),
-                contentDescription = "Hmail",
-                modifier = Modifier.size(80.dp)
+        Spacer(Modifier.height(16.dp))
+        PrimaryAction(title, enabled = !model.busy && (mode == "login" || codeEnabled), onClick = submit)
+        if (mode == "login") {
+            Spacer(Modifier.height(8.dp))
+            SplitRow(
+                first = {
+                    TextAction("注册", modifier = Modifier.fillMaxWidth()) { onNavigate(Routes.Register) }
+                },
+                second = {
+                    TextAction("忘记密码", modifier = Modifier.fillMaxWidth()) { onNavigate(Routes.Reset) }
+                }
             )
-            Spacer(Modifier.height(32.dp))
-            HmailField(
-                value = email,
-                onValueChange = { email = it; values["email"] = it; emailError = null },
-                label = "邮箱地址",
-                keyboardType = KeyboardType.Email,
-                isError = emailError != null,
-                errorText = emailError
-            )
-            HmailField(
-                value = password,
-                onValueChange = { password = it; passwordError = null },
-                label = if (mode == "login") "密码" else "新密码",
-                password = true,
-                isError = passwordError != null,
-                errorText = passwordError
-            )
-            if (mode != "login") {
-                HmailField(
-                    value = code,
-                    onValueChange = { input -> code = input.filter { it.isDigit() }.take(6); codeError = null },
-                    label = "验证码",
-                    keyboardType = KeyboardType.Number,
-                    isError = codeError != null,
-                    errorText = codeError
-                )
-                Spacer(Modifier.height(8.dp))
-                SecondaryAction(
-                    title = if (remaining > 0) "$remaining 秒后重发" else "获取验证码",
-                    enabled = !model.busy && remaining == 0L && codeEnabled,
-                    onClick = sendCode
-                )
-            }
-            Spacer(Modifier.height(16.dp))
-            PrimaryAction(title, enabled = !model.busy && (mode == "login" || codeEnabled), onClick = submit)
-            if (mode == "login") {
-                Spacer(Modifier.height(8.dp))
-                SplitRow(
-                    first = {
-                        TextAction("注册", modifier = Modifier.fillMaxWidth()) { onNavigate(Routes.Register) }
-                    },
-                    second = {
-                        TextAction("忘记密码", modifier = Modifier.fillMaxWidth()) { onNavigate(Routes.Reset) }
-                    }
-                )
-            }
         }
     }
 }

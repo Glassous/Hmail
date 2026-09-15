@@ -52,6 +52,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.glassous.hmail.MailIcon
+import com.glassous.hmail.ui.glass.glassSource
+import com.glassous.hmail.ui.glass.rememberGlassBackdrop
 import com.glassous.hmail.ui.theme.HmailTheme
 
 /** 状态栏高度（安全区顶部）。 */
@@ -207,8 +209,15 @@ fun ConfirmDialog(title: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {
 }
 
 /**
- * 非首页页面的沉浸式骨架：顶部栏延伸到状态栏后方，内容左右留 20dp，
- * 底部留出系统导航栏安全区并在软键盘弹出时上推。
+ * 全应用统一的沉浸式页面骨架（非首页页面同样使用悬浮玻璃顶栏）：
+ *
+ * - 内容满屏穿透状态栏与导航栏，滚动内容从顶栏下方开始并可在玻璃后面滚动；
+ * - 顶栏是「导航按钮 + 标题」合并的单块玻璃，页面在顶部时标题为第二行大字，
+ *   向下滚动时平滑折进顶栏；
+ * - 右侧操作项每个各自独占一块玻璃；
+ * - 软键盘弹出时内容整体上推，底部按钮不被遮挡。
+ *
+ * [title] 为 null 时不渲染顶栏（例如登录页）。
  */
 @Composable
 fun MailPage(
@@ -218,54 +227,68 @@ fun MailPage(
     progress: Boolean = false,
     scroll: Boolean = true,
     horizontalPadding: Dp = 20.dp,
-    actions: @Composable RowScope.() -> Unit = {},
+    bottomPadding: Dp = 24.dp,
+    navigationIcon: String = "back",
+    navigationDescription: String = "返回",
+    actions: List<GlassAction> = emptyList(),
+    contentArrangement: Arrangement.Vertical = Arrangement.Top,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    Column(modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        if (title != null) {
-            Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)) {
-                Spacer(Modifier.height(topInset()))
-                Row(
-                    modifier = Modifier.fillMaxWidth().height(64.dp).padding(horizontal = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (onBack != null) {
-                        IconButton(onClick = onBack) { MailIcon("back", contentDescription = "返回") }
-                    }
-                    Text(
-                        text = title,
-                        modifier = Modifier.weight(1f).padding(start = if (onBack == null) 12.dp else 0.dp),
-                        style = MaterialTheme.typography.titleLarge,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    actions()
-                }
-            }
-        } else {
-            Spacer(Modifier.height(topInset()))
-        }
-        Box(Modifier.fillMaxWidth().height(2.dp)) {
-            if (progress) LinearProgressIndicator(Modifier.fillMaxSize())
-        }
+    val background = MaterialTheme.colorScheme.background
+    val backdrop = rememberGlassBackdrop(background)
+    val scrollState = rememberScrollState()
+    val collapsing = rememberColumnCollapseFraction(scrollState)
+    // 不可滚动页面视为一直处于顶部，保持展开的大字标题。
+    val staticCollapse = remember { mutableStateOf(0f) }
+    val top = topInset()
+    val barTop = top + TopBarTopGap
+    val topSpace = if (title == null) top + 8.dp else barTop + TopBarExpandedHeight
+    val isGlassPage = title != null
+
+    Box(modifier.fillMaxSize().background(background)) {
+        // 内边距放在 scroll 之内：顶部留白会随内容滚走，页面内容才能在玻璃后面穿过。
         val body = Modifier
-            .weight(1f)
-            .fillMaxWidth()
+            .fillMaxSize()
+            .then(if (isGlassPage) Modifier.glassSource(backdrop) else Modifier)
             .imePadding()
+        val insets = Modifier.padding(
+            start = horizontalPadding,
+            end = horizontalPadding,
+            top = topSpace,
+            bottom = bottomPadding + bottomInset()
+        )
         if (scroll) {
             Column(
-                modifier = body.verticalScroll(rememberScrollState()).padding(
-                    start = horizontalPadding,
-                    end = horizontalPadding,
-                    top = 12.dp,
-                    bottom = 24.dp + bottomInset()
-                ),
+                modifier = body.verticalScroll(scrollState).then(insets),
+                verticalArrangement = contentArrangement,
                 content = content
             )
         } else {
             Column(
-                modifier = body.padding(bottom = bottomInset()),
+                modifier = body.then(insets),
+                verticalArrangement = contentArrangement,
                 content = content
+            )
+        }
+        if (title != null) {
+            GlassTopBar(
+                backdrop = backdrop,
+                title = title,
+                collapse = if (scroll) collapsing else staticCollapse,
+                navigationIcon = navigationIcon,
+                navigationDescription = navigationDescription,
+                onNavigationClick = onBack,
+                actions = actions,
+                topPadding = barTop,
+                modifier = Modifier.align(Alignment.TopStart)
+            )
+        }
+        if (progress) {
+            LinearProgressIndicator(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(2.dp)
+                    .align(Alignment.TopStart)
             )
         }
     }

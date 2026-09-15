@@ -10,17 +10,12 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -35,7 +30,6 @@ import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.glassous.hmail.Mail
-import com.glassous.hmail.MailIcon
 import com.glassous.hmail.MailModel
 import com.glassous.hmail.SERVER
 import com.glassous.hmail.enc
@@ -43,6 +37,7 @@ import com.glassous.hmail.openExternal
 import com.glassous.hmail.sizeText
 import com.glassous.hmail.str
 import com.glassous.hmail.ui.common.ConfirmDialog
+import com.glassous.hmail.ui.common.GlassAction
 import com.glassous.hmail.ui.common.MailPage
 import com.glassous.hmail.ui.common.SecondaryAction
 import com.glassous.hmail.ui.common.SectionText
@@ -66,7 +61,6 @@ fun ThreadScreen(
     val aid = account.ifBlank { model.active }
     var reload by remember { mutableStateOf(0) }
     var downloadPath by remember { mutableStateOf<String?>(null) }
-    var menuOpen by remember { mutableStateOf(false) }
     var pendingTrash by remember { mutableStateOf(false) }
     val inTrash = model.folder == "TRASH"
 
@@ -96,35 +90,29 @@ fun ThreadScreen(
         title = "邮件",
         onBack = onBack,
         progress = model.busy,
-        actions = {
-            IconButton(onClick = { reload++ }) { MailIcon("refresh", contentDescription = "刷新") }
-            Box {
-                IconButton(onClick = { menuOpen = true }) { MailIcon("more", contentDescription = "更多操作") }
-                val close = { menuOpen = false }
-                DropdownMenu(expanded = menuOpen, onDismissRequest = close) {
-                    ThreadMenuAction("归档", close) {
-                        model.work {
-                            model.modify(remove = listOf("INBOX"), threads = listOf(threadId))
-                            onBack()
-                        }
-                    }
-                    ThreadMenuAction("标为未读", close) {
-                        model.work {
-                            model.modify(add = listOf("UNREAD"), threads = listOf(threadId))
-                            onBack()
-                        }
-                    }
-                    ThreadMenuAction("标记垃圾邮件", close) {
-                        model.work {
-                            model.modify(add = listOf("SPAM"), remove = listOf("INBOX"), threads = listOf(threadId))
-                            onBack()
-                        }
-                    }
-                    ThreadMenuAction(if (inTrash) "恢复邮件" else "移入回收站", close) { pendingTrash = true }
-                    ThreadMenuAction("标签", close) { onLabelPick() }
+        actions = listOf(
+            GlassAction("刷新", "refresh") { reload++ },
+            GlassAction("归档") {
+                model.work {
+                    model.modify(remove = listOf("INBOX"), threads = listOf(threadId))
+                    onBack()
                 }
-            }
-        }
+            },
+            GlassAction("标为未读") {
+                model.work {
+                    model.modify(add = listOf("UNREAD"), threads = listOf(threadId))
+                    onBack()
+                }
+            },
+            GlassAction("标记垃圾邮件") {
+                model.work {
+                    model.modify(add = listOf("SPAM"), remove = listOf("INBOX"), threads = listOf(threadId))
+                    onBack()
+                }
+            },
+            GlassAction(if (inTrash) "恢复邮件" else "移入回收站") { pendingTrash = true },
+            GlassAction("标签") { onLabelPick() }
+        )
     ) {
         if (messages.isEmpty()) {
             SectionText("正在加载", muted = true)
@@ -172,17 +160,6 @@ fun ThreadScreen(
             }
         )
     }
-}
-
-@Composable
-private fun ThreadMenuAction(label: String, onDismiss: () -> Unit, action: () -> Unit) {
-    DropdownMenuItem(
-        text = { Text(label) },
-        onClick = {
-            onDismiss()
-            action()
-        }
-    )
 }
 
 @Composable

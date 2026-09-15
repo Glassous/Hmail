@@ -43,6 +43,16 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
     var composeBusy = false
     var uploading = false
     var compose: ComposeState? = null
+    /**
+     * 是否真的存在可继续编辑的草稿。
+     * 新建邮件后完全没有编辑（收件人/抄送/密送/主题/正文都为空且无附件）不算草稿，
+     * 既不会落地到本地，也不会在主页出现"继续写信"入口。
+     */
+    val hasDraft: Boolean
+        get() = compose?.let { state ->
+            listOf("to", "cc", "bcc", "subject", "text").any { state.payload.str(it).isNotBlank() } ||
+                state.attachments.isNotEmpty()
+        } ?: false
     var savedText = ""
     var theme = vault.read("theme") ?: "system"
     val forms = mutableMapOf<String, MutableMap<String, String>>()
@@ -169,7 +179,11 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         messages.filter { ids.contains(it.id) || threads.contains(it.threadId) }.forEach { it.raw.put("labels", JSONArray((it.labels - remove.toSet() + add).distinct())) }
         selected.clear(); loadList(); notice("邮件已更新"); changed()
     }
-    fun persistCompose() { compose?.let { vault.write("draft:${it.owner}", it.stored()) } }
+    fun persistCompose() {
+        val state = compose ?: return
+        if (!hasDraft) return // 没编辑过就不写本地草稿：避免留下空草稿与多余的继续编辑入口。
+        vault.write("draft:${state.owner}", state.stored())
+    }
     fun startCompose(mode: String = "", mail: Mail? = null) {
         if (compose != null) { notice("已恢复未完成的邮件"); return }
         val owner = user?.str("id") ?: return
@@ -233,6 +247,12 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
     private suspend fun saveDraftLocked() {
         val state = compose ?: return
         if (!state.dirty || state.uncertain || uploading) return
+        // 内容被清空回初始状态（等于没有编辑过）时不再写入草稿，避免留下空草稿。
+        if (!hasDraft) {
+            state.dirty = false
+            savedText = ""
+            return
+        }
         composeBusy = true; savedText = "正在保存"; changed()
         state.payload.put("version", state.payload.optInt("version", 1) + 1)
         val snapshot = JSONObject(state.payload.toString()); state.dirty = false

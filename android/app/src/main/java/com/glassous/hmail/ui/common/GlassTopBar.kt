@@ -1,5 +1,6 @@
 package com.glassous.hmail.ui.common
 
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -56,6 +57,9 @@ private val TitleGapBelowBand = 8.dp
 private val BlockGap = 8.dp
 private const val ExpandedTitleSize = 24f
 private const val CollapsedTitleSize = 16f
+
+/** 折叠态顶栏玻璃的高度。 */
+val TopBarCollapsedHeight = BandHeight
 
 /** 展开态（标题位于第二行大字）时顶栏玻璃的高度。 */
 val TopBarExpandedHeight = 96.dp
@@ -128,6 +132,18 @@ fun rememberCollapseFraction(listState: LazyListState, distance: Dp = 64.dp): St
             if (listState.firstVisibleItemIndex > 0) 1f
             else (listState.firstVisibleItemScrollOffset / distancePx).coerceIn(0f, 1f)
         }
+    }
+}
+
+/**
+ * 由普通滚动容器的滚动量推导 0..1 的折叠进度（用于 [MailPage] 这类 `verticalScroll` 页面）。
+ * 同样只创建 `derivedStateOf`，读取发生在顶栏内部。
+ */
+@Composable
+fun rememberColumnCollapseFraction(scrollState: ScrollState, distance: Dp = 64.dp): State<Float> {
+    val distancePx = with(LocalDensity.current) { distance.toPx() }
+    return remember(scrollState, distancePx) {
+        derivedStateOf { (scrollState.value / distancePx).coerceIn(0f, 1f) }
     }
 }
 
