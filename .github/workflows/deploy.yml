@@ -96,11 +96,49 @@ jobs:
           SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
         run: |
+          set -euo pipefail
+
+          if [ -z "${SERVER_HOST:-}" ] || [ -z "${SSH_KEY:-}" ]; then
+            echo "::error::SERVER_HOST 与 SERVER_SSH_KEY 均为必填 Secret，请检查 Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
+          case "$SSH_KEY" in
+            *"PRIVATE KEY"*) ;;
+            *)
+              echo "::error::SERVER_SSH_KEY 不是有效的 OpenSSH 私钥，需包含完整的 BEGIN/END OPENSSH PRIVATE KEY 两行"
+              exit 1
+              ;;
+          esac
+
           mkdir -p ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 700 ~/.ssh
+          # 去掉可能存在的 Windows 换行与首尾引号，否则 ssh 会拒绝该密钥
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p "${{ env.SSH_PORT }}" -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
-          echo "ServerAliveInterval 30" >> ~/.ssh/config
+
+          # 统一连接参数：免交互、首次自动记录主机指纹（避免 ssh 因无法确认主机而失败）
+          {
+            echo "Host *"
+            echo "  UserKnownHostsFile ~/.ssh/known_hosts"
+            echo "  StrictHostKeyChecking accept-new"
+            echo "  BatchMode yes"
+            echo "  ServerAliveInterval 30"
+            echo "  ServerAliveCountMax 3"
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+          if ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null 2>&1; then
+            echo "私钥格式校验通过"
+          else
+            echo "::error::私钥无法解析，请确认粘贴内容完整、未加密（无 passphrase）、且为 openssh 或 rsa 格式"
+            exit 1
+          fi
+
+          if ! ssh-keyscan -p "${{ env.SSH_PORT }}" -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null; then
+            echo "::warning::ssh-keyscan 未能获取主机指纹，改用 accept-new 策略；若下一步仍失败，请检查 22 端口是否对 GitHub Runner 开放"
+          fi
+          ssh-keygen -l -f ~/.ssh/known_hosts >/dev/null 2>&1 || true
 
       - name: 准备服务器目录
         env:
