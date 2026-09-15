@@ -150,18 +150,41 @@ jobs:
              sudo chown -R \$USER '${{ env.DEPLOY_DIR }}' '${{ env.WEB_ROOT }}' && \
              sudo chmod -R a+rX '${{ env.WEB_ROOT }}'"
 
-      - name: 预检 .env（缺失则提前失败，避免误导性报错）
+      - name: 预检 .env（缺失或字段不全则提前失败）
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
         run: |
+          cat > preflight.sh <<'PREFLIGHT'
+          set -euo pipefail
+          env_file="$1"
+          value_of() {
+            sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$env_file" | tail -n 1 | sed -e "s/^\"//" -e "s/\"$//" -e "s/^'//" -e "s/'$//" -e "s/[[:space:]]*$//"
+          }
+          if [ ! -f "$env_file" ]; then
+            echo "::error::$env_file 不存在，请先在服务器创建生产配置"
+            exit 1
+          fi
+          missing=""
+          for key in HMAIL_IMAGE POSTGRES_PASSWORD TOKEN_ENCRYPTION_KEY PUBLIC_URL; do
+            if [ -z "$(value_of "$key")" ]; then missing="$missing $key"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::$env_file 缺少必需配置:$missing"
+            exit 1
+          fi
+          image="$(value_of HMAIL_IMAGE)"
+          case "$image" in
+            *[A-Z]*) echo "::error::HMAIL_IMAGE($image) 含大写字母，GHCR 要求全小写"; exit 1 ;;
+          esac
+          case "$(value_of PUBLIC_URL)" in
+            https://*|http://*) ;;
+            *) echo "::error::PUBLIC_URL 必须带协议前缀，例如 https://hmail.fiacloud.top"; exit 1 ;;
+          esac
+          echo "预检通过：HMAIL_IMAGE=$image"
+          PREFLIGHT
           ssh -p "${{ env.SSH_PORT }}" "$SERVER_USER@$SERVER_HOST" \
-            "if [ -f '${{ env.DEPLOY_DIR }}/.env' ]; then \
-               echo '.env 已就绪'; \
-             else \
-               echo '::error::${{ env.DEPLOY_DIR }}/.env 不存在，请先在服务器按 .env.example 创建生产配置（含 HMAIL_IMAGE / POSTGRES_PASSWORD / TOKEN_ENCRYPTION_KEY / PUBLIC_URL）'; \
-               exit 1; \
-             fi"
+            "bash -s ${{ env.DEPLOY_DIR }}/.env" < preflight.sh
 
       - name: 同步编排文件与发布脚本
         env:
