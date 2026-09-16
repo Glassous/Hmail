@@ -3,6 +3,7 @@ package com.glassous.hmail.ui
 import android.app.Activity
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
@@ -143,7 +144,8 @@ fun HmailApp(model: MailModel, activity: ComponentActivity) {
                 }
             }
         ) {
-            Box(Modifier.fillMaxSize()) {
+            // 共享元素过渡作用域：主页写信入口 ↔ 写邮件页顶部栏。
+            SharedTransitionLayout(modifier = Modifier.fillMaxSize()) {
                 NavHost(navController = navController, startDestination = startRoute) {
                     composable(Routes.Login) {
                         AuthScreen(model, "login") { target -> navController.navigate(target) }
@@ -154,14 +156,23 @@ fun HmailApp(model: MailModel, activity: ComponentActivity) {
                     composable(Routes.Reset) {
                         AuthScreen(model, "reset") { target -> navController.resetTo(target) }
                     }
-                    composable(Routes.Inbox) {
+                    composable(
+                        route = Routes.Inbox,
+                        // 与写邮件页之间由共享元素连接：进出都不做整页淡变。
+                        enterTransition = { enterFrom(Routes.Compose) },
+                        exitTransition = { exitTo(Routes.Compose) },
+                        popEnterTransition = { enterFrom(Routes.Compose) }
+                    ) {
                         InboxScreen(
                             model = model,
                             onOpenDrawer = { scope.launch { drawerState.open() } },
                             onOpenThread = { account, thread -> navController.navigate(Routes.thread(account, thread)) },
-                            onCompose = { navController.navigate(Routes.Compose) },
+                            onCompose = { navController.navigate(Routes.compose(draft = false)) },
+                            onContinueDraft = { navController.navigate(Routes.compose(draft = true)) },
                             onConnect = { navController.navigate(Routes.Connect) },
-                            onLabelPick = { navController.navigate(Routes.labelPick("")) }
+                            onLabelPick = { navController.navigate(Routes.labelPick("")) },
+                            sharedTransitionScope = this@SharedTransitionLayout,
+                            animatedVisibilityScope = this
                         )
                     }
                     composable(
@@ -176,15 +187,25 @@ fun HmailApp(model: MailModel, activity: ComponentActivity) {
                             account = backStackEntry.arguments?.getString(Args.Account).orEmpty(),
                             threadId = backStackEntry.arguments?.getString(Args.Thread).orEmpty(),
                             onBack = { navController.popBackStack() },
-                            onCompose = { navController.navigate(Routes.Compose) },
+                            onCompose = { navController.navigate(Routes.compose(draft = false)) },
                             onLabelPick = { navController.navigate(Routes.labelPick(backStackEntry.arguments?.getString(Args.Thread).orEmpty())) }
                         )
                     }
-                    composable(Routes.Compose) {
+                    composable(
+                        route = Routes.Compose,
+                        arguments = listOf(navArgument(Args.Draft) { type = NavType.BoolType; defaultValue = false }),
+                        // 从主页进入（或被返回）时共享元素负责连接，页面本身不淡变。
+                        enterTransition = { enterFrom(Routes.Inbox) },
+                        exitTransition = { exitTo(Routes.Inbox) },
+                        popExitTransition = { exitTo(Routes.Inbox) }
+                    ) { entry ->
                         ComposeScreen(
                             model = model,
+                            draft = entry.arguments?.getBoolean(Args.Draft) == true,
                             onBack = { navController.popBackStack() },
-                            onOpenSent = { navController.resetTo(Routes.Inbox) }
+                            onOpenSent = { navController.resetTo(Routes.Inbox) },
+                            sharedTransitionScope = this@SharedTransitionLayout,
+                            animatedVisibilityScope = this
                         )
                     }
                     composable(Routes.Accounts) {
@@ -232,13 +253,15 @@ fun HmailApp(model: MailModel, activity: ComponentActivity) {
                         )
                     }
                 }
-                SnackbarHost(
-                    hostState = snackbar,
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .windowInsetsPadding(WindowInsets.navigationBars)
-                        .padding(16.dp)
-                )
+                // 共享层本身不是 BoxScope，居中对齐交给一层全屏 Box。
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+                    SnackbarHost(
+                        hostState = snackbar,
+                        modifier = Modifier
+                            .windowInsetsPadding(WindowInsets.navigationBars)
+                            .padding(16.dp)
+                    )
+                }
             }
         }
     }

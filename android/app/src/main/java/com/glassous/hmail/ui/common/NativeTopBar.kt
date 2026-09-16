@@ -32,7 +32,9 @@ fun NativeTopBar(
     navigationIcon: String = "back",
     navigationDescription: String = "返回",
     onNavigationClick: (() -> Unit)? = null,
-    actions: List<GlassAction> = emptyList()
+    actions: List<GlassAction> = emptyList(),
+    /** 标题文字的修饰符（共享元素过渡用）。 */
+    titleTextModifier: Modifier = Modifier
 ) {
     TopAppBar(
         modifier = modifier,
@@ -51,10 +53,11 @@ fun NativeTopBar(
                     }
                     Text(
                         text = title,
+                        // 共享元素边界对齐文字本身：padding 放在过渡修饰符外侧。
                         modifier = Modifier.padding(
                             start = if (onNavigationClick == null) 20.dp else 0.dp,
                             end = 20.dp
-                        ),
+                        ).then(titleTextModifier),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )

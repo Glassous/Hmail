@@ -6,7 +6,7 @@ object Routes {
     const val Register = "register"
     const val Reset = "reset"
     const val Inbox = "inbox"
-    const val Compose = "compose"
+    const val Compose = "compose?draft={draft}"
     const val Accounts = "accounts"
     const val Connect = "connect"
     const val Settings = "settings"
@@ -21,6 +21,9 @@ object Routes {
     fun labelEdit(label: String) = "label_edit?label=${enc(label)}"
     fun labelPick(thread: String) = "label_pick?thread=${enc(thread)}"
 
+    /** 写邮件页；[draft] 为 true 表示从「继续写信」入口进入，标题与共享元素沿用该入口。 */
+    fun compose(draft: Boolean) = "compose?draft=$draft"
+
     /** 认证区页面：会话恢复/失效时就近跳转。 */
     val auth = setOf(Login, Register, Reset)
 
@@ -34,4 +37,5 @@ object Args {
     const val Account = "account"
     const val Thread = "thread"
     const val Label = "label"
+    const val Draft = "draft"
 }

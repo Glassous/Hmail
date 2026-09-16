@@ -221,6 +221,10 @@ fun MailPage(
     navigationDescription: String = "返回",
     actions: List<GlassAction> = emptyList(),
     contentArrangement: Arrangement.Vertical = Arrangement.Top,
+    /** 页面根容器（背景与全部组件）的修饰符（共享元素过渡用）。 */
+    pageModifier: Modifier = Modifier,
+    /** 顶栏标题文字的修饰符（共享元素过渡用）。 */
+    titleTextModifier: Modifier = Modifier,
     /** 页面级浮层，参数是顶栏下方的内容起始位置。 */
     overlay: (@Composable BoxScope.(Dp) -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit
@@ -230,7 +234,7 @@ fun MailPage(
     val top = topInset()
     val topSpace = if (title == null) top + 8.dp else top + 64.dp
 
-    Box(modifier.fillMaxSize().background(background)) {
+    Box(modifier.fillMaxSize().background(background).then(pageModifier)) {
         // 内边距放在 scroll 之内：顶部留白会随内容滚走，页面内容才能在半透明顶栏后面穿过。
         val body = Modifier
             .fillMaxSize()
@@ -261,6 +265,7 @@ fun MailPage(
                 navigationDescription = navigationDescription,
                 onNavigationClick = onBack,
                 actions = actions,
+                titleTextModifier = titleTextModifier,
                 modifier = Modifier.align(Alignment.TopStart)
             )
         }
