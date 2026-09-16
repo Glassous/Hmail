@@ -9,7 +9,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, InvalidHashError
 from cryptography.fernet import Fernet
 from redis import Redis
-from sqlalchemy import create_engine, String, Text, Integer, ForeignKey, DateTime
+from sqlalchemy import create_engine, String, Text, Integer, ForeignKey, DateTime, Float, Index, Boolean
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 PUBLIC_URL = os.getenv('PUBLIC_URL', 'http://localhost:5173').rstrip('/')
@@ -58,6 +58,68 @@ class Account(Base):
     secret: Mapped[str] = mapped_column(Text)
     sync_state: Mapped[str] = mapped_column(Text, default='{}')
     status: Mapped[str] = mapped_column(String(20), default='connected')
+    credential_version: Mapped[int] = mapped_column(Integer, default=1, server_default='1')
+    write_revision: Mapped[int] = mapped_column(Integer, default=0, server_default='0')
+    accessed_at: Mapped[float] = mapped_column(Float, default=0, server_default='0')
+
+
+class MailFolder(Base):
+    __tablename__ = 'mail_folders'
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey('gmail_accounts.id', ondelete='CASCADE'), index=True)
+    folder: Mapped[str] = mapped_column(Text)
+    label: Mapped[str] = mapped_column(Text, default='{}')
+    checkpoint: Mapped[str] = mapped_column(Text, default='{}')
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    synced_at: Mapped[float] = mapped_column(Float, default=0)
+
+
+class MailSummary(Base):
+    __tablename__ = 'mail_summaries'
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey('gmail_accounts.id', ondelete='CASCADE'), index=True)
+    folder_key: Mapped[str] = mapped_column(ForeignKey('mail_folders.key', ondelete='CASCADE'), index=True)
+    message_id: Mapped[str] = mapped_column(Text)
+    thread_id: Mapped[str] = mapped_column(Text)
+    sort_at: Mapped[float] = mapped_column(Float, default=0)
+    data: Mapped[str] = mapped_column(Text)
+    scan: Mapped[str] = mapped_column(String(36), default='')
+    __table_args__ = (Index('ix_summary_thread', 'folder_key', 'thread_id'),)
+
+
+class MailThread(Base):
+    __tablename__ = 'mail_threads'
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    folder_key: Mapped[str] = mapped_column(ForeignKey('mail_folders.key', ondelete='CASCADE'))
+    thread_id: Mapped[str] = mapped_column(Text)
+    sort_at: Mapped[float] = mapped_column(Float)
+    data: Mapped[str] = mapped_column(Text)
+    __table_args__ = (Index('ix_threads_page', 'folder_key', 'sort_at', 'key'),)
+
+
+class SyncJob(Base):
+    __tablename__ = 'sync_jobs'
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey('gmail_accounts.id', ondelete='CASCADE'), index=True)
+    folder: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default='queued')
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[float] = mapped_column(Float, default=0)
+    lease_until: Mapped[float] = mapped_column(Float, default=0)
+    owner: Mapped[str] = mapped_column(String(36), default='')
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(String(100), default='')
+
+
+class ComposeOperation(Base):
+    __tablename__ = 'compose_operations'
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey('gmail_accounts.id', ondelete='CASCADE'), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    draft: Mapped[str] = mapped_column(Text, default='{}')
+    send_status: Mapped[str] = mapped_column(String(20), default='')
+    result: Mapped[str] = mapped_column(Text, default='{}')
 
 
 def encrypt(data):

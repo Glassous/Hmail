@@ -1,13 +1,13 @@
 name: hmail
 services:
   api:
-    build:
+    build: &backend-build
       context: ./backend
       args:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     ports:
       - "127.0.0.1:8184:8000"
-    environment:
+    environment: &backend-env
       DATABASE_URL: postgresql+psycopg://hmail:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db/hmail
       REDIS_URL: redis://redis:6379/0
       TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?Set TOKEN_ENCRYPTION_KEY}
@@ -19,9 +19,18 @@ services:
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:5173}
+      MAIL_INDEX_ENABLED: ${MAIL_INDEX_ENABLED:-true}
+      MAIL_SYNC_JOBS_ENABLED: ${MAIL_SYNC_JOBS_ENABLED:-true}
+      MAIL_REMOTE_LIMIT: ${MAIL_REMOTE_LIMIT:-16}
+      MAIL_BACKGROUND_LIMIT: ${MAIL_BACKGROUND_LIMIT:-4}
+      MAIL_ACCOUNT_READ_LIMIT: ${MAIL_ACCOUNT_READ_LIMIT:-2}
+      MAIL_POOL_IDLE: ${MAIL_POOL_IDLE:-60}
     volumes:
       - ./backend/app:/app/app
+      - mail_uploads:/tmp/hmail-uploads
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       redis:
@@ -29,6 +38,33 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  migrate:
+    build: *backend-build
+    environment: *backend-env
+    command: ["python", "-m", "app.migrate"]
+    volumes:
+      - ./backend/app:/app/app
+    depends_on:
+      db:
+        condition: service_healthy
+  worker:
+    build: *backend-build
+    environment: *backend-env
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - ./backend/app:/app/app
+      - mail_uploads:/tmp/hmail-uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.core import cache; assert cache.get('mail-worker-heartbeat')"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -58,5 +94,6 @@ services:
       timeout: 5s
       retries: 10
 volumes:
+  mail_uploads:
   postgres_data:
   redis_data:

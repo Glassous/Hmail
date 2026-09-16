@@ -24,7 +24,7 @@ from google_auth_oauthlib.flow import Flow
 from google.auth.exceptions import RefreshError
 from pydantic import BaseModel, Field, field_validator
 from redis.exceptions import RedisError, LockError
-from sqlalchemy import select, text, delete
+from sqlalchemy import select, text, delete, update
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
@@ -33,6 +33,8 @@ from .emailer import send_code as send_code_mail, smtp_configured
 from .mail import MailError, MAX_ATTACHMENT, build_message, recipients, safe_html, sign_url, verify_url_sig, b64, unb64
 from .presets import MAIL_PRESETS
 from .providers import GmailApiProvider, ImapSmtpProvider
+from .concurrency import admission, slots, imap_client, discard_account
+from . import indexing
 
 app = FastAPI(title='Hmail API', version='1.0.0', docs_url=None, redoc_url=None, openapi_url='/api/openapi.json')
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -60,7 +62,7 @@ async def request_context(request, call_next):
 
 @app.exception_handler(MailError)
 async def mail_error(request, exc):
-    return JSONResponse({'code': exc.code, 'message': exc.message, 'requestId': request.state.request_id}, status_code=exc.status)
+    return JSONResponse({'code': exc.code, 'message': exc.message, 'requestId': request.state.request_id}, status_code=exc.status, headers={'Retry-After': '2'} if exc.status == 429 else None)
 
 
 @app.exception_handler(RequestValidationError)
@@ -287,6 +289,9 @@ def account_for(user, aid):
         account = db.get(Account, aid)
     if not account or account.user_id != user.id:
         raise MailError('邮箱不存在', 'not_found', 404)
+    if cache.set(f'mail-active:{aid}', '1', nx=True, ex=60):
+        with Session.begin() as db:
+            db.execute(update(Account).where(Account.id == aid).values(accessed_at=time.time()))
     return account
 
 
@@ -295,44 +300,48 @@ def account_view(account):
 
 
 def invalidate(user_id, aid):
-    for key in cache.scan_iter(f'mail:{user_id}:{aid}:*', count=100):
-        cache.delete(key)
+    cache.incr(f'mail-version:{aid}')
 
 
 @contextmanager
-def provider_for(user, aid):
-    account = account_for(user, aid)
-    lock = cache.lock('account-lock:' + aid, timeout=600, blocking_timeout=2)
-    if not lock.acquire():
-        raise MailError('邮箱正在处理其他请求，请稍后重试', 'busy', 409)
-    provider = None
-    try:
-        # Re-read after obtaining the lock to avoid using stale credentials.
+def provider_for(user, aid, lane='read'):
+    with admission(aid, lane) as lost:
         account = account_for(user, aid)
-        def save_secret(value):
-            with Session() as db:
-                row = db.get(Account, aid)
-                row.secret = encrypt(value)
-                db.commit()
-        cls = GmailApiProvider if account.provider == 'oauth' else ImapSmtpProvider
-        provider = cls(account.email, decrypt(account.secret), save_secret)
-        yield provider, account
-    except (RefreshError, imaplib.IMAP4.error, smtplib.SMTPAuthenticationError):
-        with Session() as db:
-            row = db.get(Account, aid)
-            if row:
-                row.status = 'reconnect'
-                db.commit()
-        raise MailError('邮箱连接已失效，请重新连接或更新密码/授权码', 'reconnect', 401) from None
-    except (TimeoutError, OSError):
-        raise MailError('连接邮箱超时，请检查网络后重试', 'network', 502) from None
-    finally:
-        if provider:
-            provider.close()
         try:
-            lock.release()
-        except LockError:
-            pass
+            if account.provider == 'oauth':
+                from google.oauth2.credentials import Credentials as GoogleCredentials
+                from google.auth.transport.requests import Request as GoogleRequest
+                secret = decrypt(account.secret)
+                if not GoogleCredentials.from_authorized_user_info(secret, SCOPES).valid:
+                    with slots([(f'{aid}:credentials', 1)]):
+                        account = account_for(user, aid)
+                        credentials = GoogleCredentials.from_authorized_user_info(decrypt(account.secret), SCOPES)
+                        if not credentials.valid:
+                            credentials.refresh(GoogleRequest())
+                            with Session() as db:
+                                updated = db.execute(update(Account).where(Account.id == aid, Account.credential_version == account.credential_version).values(secret=encrypt(json.loads(credentials.to_json()))))
+                                if not updated.rowcount:
+                                    raise MailError('邮箱连接已更新，请重试', 'account_changed', 409)
+                                db.commit()
+                        secret = json.loads(credentials.to_json())
+                provider = GmailApiProvider(account.email, secret)
+                try:
+                    yield provider, account
+                finally:
+                    provider.close()
+            else:
+                with imap_client(account, lambda: ImapSmtpProvider(account.email, decrypt(account.secret)), lane) as provider:
+                    yield provider, account
+                    latest = account_for(user, aid)
+                    if latest.credential_version != account.credential_version or lost.is_set():
+                        raise MailError('邮箱连接已更新，请重试', 'account_changed', 409)
+        except (RefreshError, smtplib.SMTPAuthenticationError):
+            with Session() as db:
+                db.execute(update(Account).where(Account.id == aid, Account.credential_version == account.credential_version).values(status='reconnect'))
+                db.commit()
+            raise MailError('邮箱连接已失效，请重新连接', 'reconnect', 401) from None
+        except (TimeoutError, OSError, imaplib.IMAP4.abort):
+            raise MailError('连接邮箱超时，请稍后重试', 'network', 502) from None
 
 
 def save_account(user, email, kind, secret):
@@ -342,15 +351,14 @@ def save_account(user, email, kind, secret):
         if account and account.user_id != user.id:
             raise MailError('此邮箱已连接其他平台账户', 'conflict', 409)
         if account:
-            lock = cache.lock('account-lock:' + account.id, timeout=30, blocking_timeout=2)
-            if not lock.acquire():
-                raise MailError('邮箱正在使用中，请稍后再试', 'busy', 409)
-            try:
+            with slots([(f'{account.id}:write', 1), (f'{account.id}:credentials', 1)]):
+                db.refresh(account)
                 account.provider, account.secret, account.status, account.sync_state = kind, encrypt(secret), 'connected', '{}'
+                account.credential_version += 1
+                indexing.clear_account(db, account.id)
                 db.commit()
                 invalidate(user.id, account.id)
-            finally:
-                lock.release()
+                discard_account(account.id)
         else:
             account = Account(user_id=user.id, email=canonical, provider=kind, secret=encrypt(secret))
             db.add(account)
@@ -358,6 +366,8 @@ def save_account(user, email, kind, secret):
                 db.commit()
             except IntegrityError:
                 raise MailError('此邮箱已连接，请刷新', 'conflict', 409) from None
+    if indexing.ENABLED:
+        indexing.enqueue(account.id, 'INBOX', 20)
     return account_view(account)
 
 
@@ -562,35 +572,43 @@ def oauth_callback(request: Request, state: str = '', code: str = '', error: str
 @app.delete(PREFIX + '/gmail-accounts/{aid}')
 def disconnect(aid: str, user=Depends(current_user)):
     account_for(user, aid)
-    lock = cache.lock('account-lock:' + aid, timeout=30, blocking_timeout=2)
-    if not lock.acquire():
-        raise MailError('邮箱正在使用中，请稍后重试', 'busy', 409)
-    try:
+    with slots([(f'{aid}:write', 1), (f'{aid}:credentials', 1)]):
         with Session() as db:
+            indexing.clear_account(db, aid)
+            db.execute(delete(ComposeOperation).where(ComposeOperation.account_id == aid))
             db.execute(delete(Account).where(Account.id == aid, Account.user_id == user.id))
             db.commit()
         invalidate(user.id, aid)
-    finally:
-        lock.release()
+        discard_account(aid)
     return {'ok': True}
 
 
 def cached_call(user, aid, suffix, ttl, fn):
-    account_for(user, aid)
-    key = f'mail:{user.id}:{aid}:' + hashlib.sha256(suffix.encode()).hexdigest()
+    account = account_for(user, aid)
+    version = 'content' if suffix.startswith('message:') else cache.get(f'mail-version:{aid}') or '0'
+    key = f'mail:{user.id}:{aid}:{account.credential_version}:{version}:' + hashlib.sha256(suffix.encode()).hexdigest()
     cached = cache.get(key)
     if cached:
-        return json.loads(cached)
-    with provider_for(user, aid) as (provider, _):
-        result = fn(provider)
-        cache.setex(key, ttl, json.dumps(result))
-    return result
+        return indexing.overlay_labels(aid, json.loads(cached))
+    with slots([('fetch:' + key, 1)], wait=35):
+        cached = cache.get(key)
+        if cached:
+            return indexing.overlay_labels(aid, json.loads(cached))
+        with provider_for(user, aid) as (provider, _):
+            result = fn(provider)
+            serialized = json.dumps(result)
+            if len(serialized.encode()) <= 1024 * 1024:
+                cache.setex(key, ttl, serialized)
+    return indexing.overlay_labels(aid, result)
 
 
 @app.get(PREFIX + '/gmail-accounts/{aid}/threads')
 def threads(aid: str, folder: str = 'INBOX', q: str = '', cursor: str = '', user=Depends(current_user)):
     if len(q) > 2000 or len(cursor) > 2000:
         raise MailError('搜索参数过长', 'validation', 422)
+    account_for(user, aid)
+    if indexing.ENABLED and not q:
+        return indexing.list_threads(aid, folder, cursor)
     return cached_call(user, aid, json.dumps(['list', folder, q, cursor]), 60, lambda p: p.list(folder, q, cursor))
 
 
@@ -775,6 +793,12 @@ def attachment(aid: str, mid: str, part: str, request: Request, sig: str = ''):
 
 @app.get(PREFIX + '/gmail-accounts/{aid}/labels')
 def labels(aid: str, user=Depends(current_user)):
+    account_for(user, aid)
+    if indexing.ENABLED:
+        result = indexing.labels(aid)
+        if not result:
+            indexing.enqueue(aid, 'INBOX', 20, True)
+        return result
     return cached_call(user, aid, 'labels', 60, lambda p: p.labels())
 
 
@@ -788,11 +812,15 @@ class LabelAction(BaseModel):
 def label_action(aid: str, data: LabelAction, user=Depends(current_user)):
     if data.action != 'delete' and not data.name.strip():
         raise MailError('标签名称不能为空', 'validation', 422)
-    with provider_for(user, aid) as (provider, _):
+    with provider_for(user, aid, 'write') as (provider, _):
         if data.action != 'create' and not any(l['id'] == data.id and l.get('type') == 'user' for l in provider.labels()):
             raise MailError('仅能修改自定义标签', 'validation', 422)
         provider.label(data.action, data.id, data.name.strip())
+        indexing.fence_write(aid)
         invalidate(user.id, aid)
+        with Session.begin() as db:
+            for label in provider.labels():
+                indexing.ensure_folder(db, aid, label['id'], label)
     return {'ok': True}
 
 
@@ -808,16 +836,27 @@ class Modify(BaseModel):
 def modify(aid: str, data: Modify, user=Depends(current_user)):
     if not data.ids and not data.threadIds:
         raise MailError('请选择邮件', 'validation', 422)
-    with provider_for(user, aid) as (provider, _):
-        if data.threadIds:
-            provider.thread_modify(data.threadIds, data.add, data.remove, data.action)
-        elif data.action == 'labels':
-            provider.modify(data.ids, data.add, data.remove)
-        else:
-            for identifier in data.ids:
-                provider.move(identifier, data.action == 'trash')
-        invalidate(user.id, aid)
-    return {'ok': True}
+    results = []
+    for identifier in data.threadIds or data.ids:
+        try:
+            with provider_for(user, aid, 'write') as (provider, account):
+                indexing.fence_write(aid)
+                if data.threadIds:
+                    provider.thread_modify([identifier], data.add, data.remove, data.action)
+                elif data.action == 'labels':
+                    provider.modify([identifier], data.add, data.remove)
+                else:
+                    provider.move(identifier, data.action == 'trash')
+                indexing.update_after_write(aid, [] if data.threadIds else [identifier], [identifier] if data.threadIds else [], data.add, data.remove, data.action, account.provider == 'imap')
+                invalidate(user.id, aid)
+            results.append({'id': identifier, 'ok': True})
+        except MailError as exc:
+            results.append({'id': identifier, 'ok': False, 'code': exc.code, 'message': exc.message})
+    if indexing.ENABLED:
+        indexing.enqueue(aid, 'INBOX', 10)
+        for folder in set(data.add + data.remove + (['TRASH'] if data.action in ('trash', 'untrash') else [])) - {'UNREAD', 'STARRED'}:
+            indexing.enqueue(aid, folder, 10)
+    return {'ok': all(r['ok'] for r in results), 'results': results}
 
 
 def cleanup_uploads():
@@ -906,24 +945,50 @@ def draft_get(aid: str, did: str, user=Depends(current_user)):
 
 @app.put(PREFIX + '/gmail-accounts/{aid}/drafts')
 def draft_save(aid: str, data: Compose, user=Depends(current_user)):
-    with provider_for(user, aid) as (provider, account):
-        key = f'draft-version:{user.id}:{aid}:{data.composeId}'
-        previous = json.loads(cache.get(key) or '{}')
+    with provider_for(user, aid, 'write') as (provider, account):
+        key = indexing.key(aid, data.composeId)
+        with Session() as db:
+            operation = db.get(ComposeOperation, key)
+            if operation and operation.send_status:
+                raise MailError('此写信会话已经发送或正在确认结果', 'send_uncertain', 409)
+            previous = json.loads(operation.draft) if operation else {}
+            if previous.get('pending'):
+                raise MailError('草稿保存结果待确认，请重新打开草稿箱', 'draft_uncertain', 409)
         if previous.get('version', 0) >= data.version:
             return previous
+        indexing.fence_write(aid)
         msg = materialize(data, user, aid, provider, account.email)
+        with Session.begin() as db:
+            operation = db.get(ComposeOperation, key)
+            if not operation:
+                operation = ComposeOperation(key=key, account_id=aid)
+                db.add(operation)
+            operation.draft = json.dumps({**previous, 'pending': True})
         did = provider.draft_save(msg, previous.get('id') or data.draftId, data.threadId)
         saved = provider.draft_get(did)
         result = {'id': did, 'version': data.version, 'attachments': [{**a, 'messageId': saved['id']} for a in saved['attachments']]}
-        cache.setex(key, 86400, json.dumps(result))
+        with Session.begin() as db:
+            operation = db.get(ComposeOperation, key)
+            if not operation:
+                operation = ComposeOperation(key=key, account_id=aid)
+                db.add(operation)
+            operation.version, operation.draft = data.version, json.dumps(result)
         invalidate(user.id, aid)
+        if indexing.ENABLED:
+            indexing.enqueue(aid, 'DRAFT', 20)
         return result
 
 
 @app.delete(PREFIX + '/gmail-accounts/{aid}/drafts/{did}')
 def draft_delete(aid: str, did: str, user=Depends(current_user)):
-    with provider_for(user, aid) as (provider, _):
+    with provider_for(user, aid, 'write') as (provider, _):
+        indexing.fence_write(aid)
         provider.draft_delete(did)
+        with Session.begin() as db:
+            for operation in db.scalars(select(ComposeOperation).where(ComposeOperation.account_id == aid)):
+                if json.loads(operation.draft).get('id') == did:
+                    operation.send_status = 'discarded'
+        indexing.update_after_write(aid, [did], [], [], ['DRAFT'], 'labels')
         invalidate(user.id, aid)
     return {'ok': True}
 
@@ -932,26 +997,37 @@ def draft_delete(aid: str, did: str, user=Depends(current_user)):
 def send(aid: str, data: Compose, request: Request, user=Depends(current_user)):
     limited(request, 'send', user.id, 30, 3600)
     envelope = recipients(data.model_dump())
-    with provider_for(user, aid) as (provider, account):
-        key = f'send:{user.id}:{aid}:{data.composeId}'
-        old = cache.get(key)
-        if old:
-            result = json.loads(old)
-            if result['status'] == 'sent':
-                return result
-            raise MailError('此邮件的发送结果尚不明确，请检查已发送，勿重复发送', 'send_uncertain', 409)
+    with provider_for(user, aid, 'write') as (provider, account):
+        key = indexing.key(aid, data.composeId)
+        with Session() as db:
+            operation = db.get(ComposeOperation, key)
+            if operation and operation.send_status:
+                if operation.send_status == 'sent':
+                    return json.loads(operation.result)
+                raise MailError('此邮件的发送结果尚不明确，请检查已发送，勿重复发送', 'send_uncertain', 409)
         msg = materialize(data, user, aid, provider, account.email)
-        cache.setex(key, 86400 * 7, json.dumps({'status': 'pending'}))
+        # Commit before contacting SMTP/Gmail. A crash can never make this retryable.
+        with Session.begin() as db:
+            operation = db.get(ComposeOperation, key)
+            if not operation:
+                operation = ComposeOperation(key=key, account_id=aid)
+                db.add(operation)
+            operation.send_status = 'pending'
+        indexing.fence_write(aid)
         try:
             result = provider.send(msg, envelope, data.threadId)
         except Exception:
             raise MailError('发送结果尚不明确，请检查已发送后再决定是否重新撰写', 'send_uncertain', 409) from None
         response = {'status': 'sent', 'result': result}
-        cache.setex(key, 86400 * 7, json.dumps(response))
+        if result.get('warning'):
+            response['warning'] = result['warning']
+        with Session.begin() as db:
+            operation = db.get(ComposeOperation, key)
+            operation.send_status, operation.result = 'sent', json.dumps(response)
         did = data.draftId
-        draft_state = cache.get(f'draft-version:{user.id}:{aid}:{data.composeId}')
+        draft_state = json.loads(operation.draft)
         if draft_state:
-            did = json.loads(draft_state)['id']
+            did = draft_state['id']
         if did:
             try:
                 provider.draft_delete(did)
@@ -962,14 +1038,46 @@ def send(aid: str, data: Compose, request: Request, user=Depends(current_user)):
                 cache.delete('upload:' + ref.id)
                 (UPLOAD_DIR / ref.id).unlink(missing_ok=True)
         invalidate(user.id, aid)
-        cache.setex(key, 86400 * 7, json.dumps(response))
+        with Session.begin() as db:
+            operation = db.get(ComposeOperation, key)
+            operation.result = json.dumps(response)
+        if indexing.ENABLED:
+            indexing.enqueue(aid, 'SENT', 20)
+            indexing.enqueue(aid, 'DRAFT', 20)
         return response
+
+
+@app.post(PREFIX + '/gmail-accounts/{aid}/sync-jobs', status_code=202)
+def sync_job(aid: str, folder: str = 'INBOX', user=Depends(current_user)):
+    account_for(user, aid)
+    if not indexing.JOBS_ENABLED:
+        raise MailError('后台同步接口未启用', 'unsupported', 404)
+    return indexing.enqueue(aid, folder, 20, True)
+
+
+@app.get(PREFIX + '/gmail-accounts/{aid}/sync-status')
+def sync_status(aid: str, folder: str = 'INBOX', user=Depends(current_user)):
+    account_for(user, aid)
+    return indexing.state(aid, folder)
 
 
 @app.post(PREFIX + '/gmail-accounts/{aid}/sync')
 def sync(aid: str, folder: str = 'INBOX', user=Depends(current_user)):
+    account_for(user, aid)
+    if indexing.ENABLED:
+        previous = indexing.state(aid, folder)['indexVersion']
+        indexing.enqueue(aid, folder, 20, True)
+        deadline = time.monotonic() + 55
+        while time.monotonic() < deadline:
+            current = indexing.state(aid, folder)
+            if current['status'] == 'completed':
+                return {'changed': previous != current['indexVersion'], 'reset': False}
+            if current['status'] in ('failed', 'retry'):
+                raise MailError('同步暂未完成，请稍后重试', current['error'] or 'sync_failed', 502)
+            time.sleep(.25)
+        raise MailError('同步仍在后台继续，请稍后查看', 'sync_timeout', 504)
     cleanup_uploads()
-    with provider_for(user, aid) as (provider, account):
+    with provider_for(user, aid, 'sync') as (provider, account):
         state, changed, reset = provider.sync(json.loads(account.sync_state), folder)
         with Session() as db:
             stored = db.get(Account, aid)

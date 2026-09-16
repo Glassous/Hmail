@@ -86,8 +86,8 @@ class GmailApiProvider:
         return unb64(result['raw']), result
 
     def message(self, identifier):
-        raw, info = self.raw(identifier)
-        return parse_message(raw, info['id'], info['threadId'], info.get('labelIds', []))
+        from .mime_parts import gmail_message
+        return gmail_message(self, self.run(self.users.messages().get(userId='me', id=identifier, format='full')))
 
     def attachment(self, identifier, part_id):
         # Fetch the MIME part through the dedicated attachment API when available.
@@ -99,18 +99,21 @@ class GmailApiProvider:
                 walk(child)
         walk(full['payload'])
         try:
-            part = flat[int(part_id)]
-        except (ValueError, IndexError):
+            part = next(p for p in flat if p.get('partId', '') == part_id[6:]) if part_id.startswith('gmail:') else flat[int(part_id)]
+        except (ValueError, IndexError, StopIteration):
             raise MailError('附件不存在', 'not_found', 404)
         body = part.get('body', {})
         if body.get('attachmentId'):
             payload = self.run(self.users.messages().attachments().get(userId='me', messageId=identifier, id=body['attachmentId']))
             return unb64(payload['data']), part.get('filename') or 'attachment', part.get('mimeType', 'application/octet-stream')
+        if part_id.startswith('gmail:'):
+            return unb64(body.get('data', '')), part.get('filename') or 'attachment', part.get('mimeType', 'application/octet-stream')
         return extract_attachment(self.raw(identifier)[0], part_id)
 
     def thread(self, identifier):
-        result = self.run(self.users.threads().get(userId='me', id=identifier, format='minimal'))
-        return [self.message(m['id']) for m in result.get('messages', [])]
+        from .mime_parts import gmail_message
+        result = self.run(self.users.threads().get(userId='me', id=identifier, format='full'))
+        return [gmail_message(self, m) for m in result.get('messages', [])]
 
     def list(self, folder='INBOX', query='', cursor=''):
         args = {'userId': 'me', 'maxResults': 30, 'includeSpamTrash': folder in ('SPAM', 'TRASH')}
@@ -122,8 +125,23 @@ class GmailApiProvider:
             args['pageToken'] = cursor
         result = self.run(self.users.threads().list(**args))
         items = []
-        for thread in result.get('threads', []):
-            detail = self.run(self.users.threads().get(userId='me', id=thread['id'], format='metadata', metadataHeaders=['Subject', 'From', 'Date', 'To']))
+        details, errors = {}, []
+        def receive(identifier, response, exception):
+            if exception:
+                if not isinstance(exception, HttpError) or exception.resp.status != 404:
+                    errors.append(exception)
+            else:
+                details[identifier] = response
+        threads = result.get('threads', [])
+        for start in range(0, len(threads), 20):
+            batch = self.service.new_batch_http_request(callback=receive)
+            for thread in threads[start:start + 20]:
+                batch.add(self.users.threads().get(userId='me', id=thread['id'], format='metadata', metadataHeaders=['Subject', 'From', 'Date', 'To']), request_id=thread['id'])
+            batch.execute()
+        if errors:
+            raise errors[0]
+        for thread in threads:
+            detail = details.get(thread['id'], {})
             messages = detail.get('messages', [])
             if not messages:
                 continue
@@ -357,11 +375,16 @@ class ImapSmtpProvider:
         return None
 
     def _select(self, wire, expected=None):
-        status, _ = self.imap.select(quote(wire), readonly=False)
+        mailbox = quote(wire)
+        if 'CONDSTORE' in self.caps and getattr(self, 'readonly', False):
+            mailbox += ' (CONDSTORE)'
+        status, _ = self.imap.select(mailbox, readonly=getattr(self, 'readonly', False))
         if status != 'OK':
             raise MailError('无法打开邮件文件夹，请刷新后重试', 'not_found', 404)
         response = self.imap.response('UIDVALIDITY')[1]
         validity = (response[0] or b'0').decode() if response else '0'
+        modseq = self.imap.response('HIGHESTMODSEQ')[1]
+        self.modseq = (modseq[0] or b'0').decode() if modseq else '0'
         if expected and str(expected) != validity:
             raise MailError('邮件已不存在，请刷新', 'not_found', 404)
         return validity
@@ -533,12 +556,17 @@ class ImapSmtpProvider:
         return wire, validity, rows[0][0], rows[0][1], rows[0][2]
 
     def message(self, identifier):
-        wire, validity, uid, flagdata, raw = self._open(identifier)
-        kind, key = self._thread_key(self._parse(raw))
-        thread_id = self._encode('t', wire, validity, uid, kind, key)
-        return parse_message(raw, identifier, thread_id, self._labels(flagdata, wire))
+        from .mime_parts import imap_message
+        return imap_message(self, identifier)
 
     def attachment(self, identifier, part_id):
+        if part_id.startswith('mime:'):
+            from .mime_parts import imap_parts, imap_part_bytes
+            _, _, uid, parts = imap_parts(self, identifier)
+            part = next((part for part in parts if part['id'] == part_id and part['attachment']), None)
+            if not part:
+                raise MailError('附件不存在', 'not_found', 404)
+            return imap_part_bytes(self, uid, part), part['name'] or 'attachment', part['type']
         return extract_attachment(self._open(identifier)[4], part_id)
 
     def thread(self, identifier):
@@ -547,7 +575,7 @@ class ImapSmtpProvider:
             raise MailError('无效会话标识', 'validation', 422)
         wire, validity, anchor, kind, key = parts[1], str(parts[2]), str(parts[3]), parts[4], parts[5]
         self._select(wire, validity)
-        rows = self._fetch([anchor.encode()], FULL_FIELDS)
+        rows = self._fetch([anchor.encode()], HEADER_FIELDS)
         if not rows:
             raise MailError('邮件已不存在，请刷新', 'not_found', 404)
         anchor_msg = self._parse(rows[0][2])
@@ -565,9 +593,10 @@ class ImapSmtpProvider:
                         uids.add(uid)
         ordered = sorted(uids, key=lambda value: int(value) if value.isdecimal() else 0)[:THREAD_LIMIT]
         messages = []
-        for start in range(0, len(ordered), 50):
-            for uid, flagdata, raw in self._fetch([value.encode() for value in ordered[start:start + 50]], FULL_FIELDS):
-                messages.append((int(uid), parse_message(raw, self._encode('m', wire, validity, uid), identifier, self._labels(flagdata, wire))))
+        for uid in ordered:
+            message = self.message(self._encode('m', wire, validity, uid))
+            message['threadId'] = identifier
+            messages.append((int(uid), message))
         return [message for _, message in sorted(messages, key=lambda pair: pair[0])]
 
     def list(self, folder='INBOX', query='', cursor=''):
@@ -729,7 +758,7 @@ class ImapSmtpProvider:
         result = {'id': str(msg['Message-ID']), 'refused': list(refused)}
         try:
             self._append(quote(self.folder_wire('SENT')), msg, '\\Seen')
-        except MailError:
+        except Exception:
             result['warning'] = '邮件已发送，但未能保存到已发送文件夹，请在服务端确认'
         return result
 

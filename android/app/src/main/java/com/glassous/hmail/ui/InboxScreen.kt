@@ -275,7 +275,7 @@ fun InboxScreen(
             searchText = model.query
             searchOpen = true
         },
-        GlassAction("刷新", "refresh", enabled = !model.loading && !model.syncing) { model.loadList(sync = true) }
+        GlassAction("刷新", "refresh", enabled = !model.syncing) { model.loadList(sync = true) }
     ) else listOf(
         // 星标按钮排在三点菜单左边，只作用于选中的邮件。
         GlassAction(
@@ -373,6 +373,7 @@ fun InboxScreen(
                         model.next.isNotBlank() -> TextButton(enabled = model.canLoadMore, onClick = model::loadMore) {
                             Text(model.moreError ?: "加载更多")
                         }
+                        !model.historyComplete -> Text("正在同步历史邮件…", color = colors.muted, style = MaterialTheme.typography.bodySmall)
                         else -> Text("已加载全部邮件", color = colors.muted, style = MaterialTheme.typography.bodySmall)
                     }
                 }

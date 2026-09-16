@@ -6,7 +6,7 @@ services:
     init: true
     ports:
       - "127.0.0.1:8184:8000"
-    environment:
+    environment: &backend-env
       DATABASE_URL: postgresql+psycopg://hmail:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db/hmail
       REDIS_URL: redis://redis:6379/0
       TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?Set TOKEN_ENCRYPTION_KEY}
@@ -18,7 +18,17 @@ services:
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-}
       PUBLIC_URL: ${PUBLIC_URL:?Set PUBLIC_URL, e.g. https://hmail.fiacloud.top}
+      MAIL_INDEX_ENABLED: ${MAIL_INDEX_ENABLED:-true}
+      MAIL_SYNC_JOBS_ENABLED: ${MAIL_SYNC_JOBS_ENABLED:-true}
+      MAIL_REMOTE_LIMIT: ${MAIL_REMOTE_LIMIT:-16}
+      MAIL_BACKGROUND_LIMIT: ${MAIL_BACKGROUND_LIMIT:-4}
+      MAIL_ACCOUNT_READ_LIMIT: ${MAIL_ACCOUNT_READ_LIMIT:-2}
+      MAIL_POOL_IDLE: ${MAIL_POOL_IDLE:-60}
+    volumes:
+      - mail_uploads:/tmp/hmail-uploads
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       redis:
@@ -35,6 +45,31 @@ services:
       timeout: 5s
       retries: 5
       start_period: 40s
+  migrate:
+    image: ${HMAIL_IMAGE:?Set HMAIL_IMAGE}
+    environment: *backend-env
+    command: ["python", "-m", "app.migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+  worker:
+    image: ${HMAIL_IMAGE:?Set HMAIL_IMAGE}
+    init: true
+    environment: *backend-env
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - mail_uploads:/tmp/hmail-uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.core import cache; assert cache.get('mail-worker-heartbeat')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
   db:
     image: postgres:18-alpine
     environment:
@@ -61,5 +96,6 @@ services:
       timeout: 5s
       retries: 10
 volumes:
+  mail_uploads:
   postgres_data:
   redis_data:

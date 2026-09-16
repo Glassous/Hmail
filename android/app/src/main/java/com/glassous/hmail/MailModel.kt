@@ -73,7 +73,11 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         private set
     var moreError by mutableStateOf<String?>(null)
         private set
-    val canLoadMore get() = paginationReady && next.isNotBlank() && !loading && !syncing
+    val canLoadMore get() = paginationReady && next.isNotBlank() && !loading
+    var historyComplete by mutableStateOf(true)
+        private set
+    private var indexVersion = 0L
+    private val pendingMail = mutableSetOf<String>()
     var listPosition = 0
     var listOffset = 0
     var loading = false
@@ -170,14 +174,12 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         persistMailboxContext(); changed()
     }
     fun work(block: suspend () -> Unit) {
-        if (busy) return
-        busy = true; changed()
         viewModelScope.launch {
             try {
                 if (user != null) ensureSession()
                 block()
             } catch (e: Exception) { fail(e) }
-            finally { busy = false; changed() }
+            finally { changed() }
         }
     }
     fun boot() {
@@ -304,7 +306,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         loadedPages = 0; paginationReady = false; next = ""; items = emptyList(); selected.clear()
         loadingMore = false; moreError = null; listPosition = 0; listOffset = 0
     }
-    fun chooseFolder(id: String) { folder = id; query = ""; resetPages(); persistMailboxContext(); loadList() }
+    fun chooseFolder(id: String) { syncJob?.cancel();syncing=false; mailboxGeneration++; folder = id; query = ""; resetPages(); persistMailboxContext(); loadList(sync=true,initial=true) }
     fun search(value: String) { query = value.trim(); resetPages(); persistMailboxContext(); loadList() }
     fun loadMore() {
         if (!canLoadMore) return
@@ -352,42 +354,32 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
                 ensureSession()
                 if (!current()) return@launch
                 val baseline = items.toList()
-                val known = baseline.map { it.threadId }.toSet()
-                val depth = if (append) 1 else loadedPages.coerceAtLeast(1)
                 var cursor = if (append) next else ""
-                var fetchedPages = 0
-                var complete = false
-                val visited = mutableSetOf<String>()
-                val incoming = linkedMapOf<String, Mail>()
-                // A missing ID on one page is not proof of deletion: new messages may have
-                // pushed it onto a later page. Resolve all known IDs or reach the remote end.
-                while (visited.add(cursor)) {
-                    val result = api.json(path("/threads?folder=${enc(chosenFolder)}&q=${enc(chosenQuery)}&cursor=${enc(cursor)}", aid))
-                    if (!current()) return@launch
-                    val pageRows = withContext(Dispatchers.Default) { result.array("items").objects().map(::Mail) }
-                    if (!current()) return@launch
-                    pageRows.forEach { incoming.putIfAbsent(it.threadId, it) }
-                    fetchedPages++
-                    cursor = result.str("nextCursor")
-                    complete = cursor.isBlank()
-                    if (!append) {
-                        // Show new/updated rows immediately; retain unconfirmed missing rows.
-                        items = incoming.values.toList() + baseline.filter { it.threadId !in incoming }
-                        localOnly = false
-                        changed()
-                    }
-                    if (complete || append || fetchedPages >= depth && incoming.keys.containsAll(known)) break
-                    if (cursor in visited) throw java.io.IOException("Repeated list cursor")
+                var restarted = false
+                val result = try {
+                    api.json(path("/threads?folder=${enc(chosenFolder)}&q=${enc(chosenQuery)}&cursor=${enc(cursor)}", aid))
+                } catch (e: ApiFailure) {
+                    if (e.code != "cursor_expired") throw e
+                    restarted = true
+                    api.json(path("/threads?folder=${enc(chosenFolder)}&q=${enc(chosenQuery)}", aid))
                 }
+                if (!current()) return@launch
+                val rows = withContext(Dispatchers.Default) { result.array("items").objects().map(::Mail) }
+                cursor = result.str("nextCursor")
                 if (current()) {
-                    val unique = incoming.values.toList()
-                    items = if (append) {
+                    val unique = rows.distinctBy { it.threadId }.map { row ->
+                        if ("$aid:${row.id}" in pendingMail || "$aid:${row.threadId}" in pendingMail) baseline.find { it.id == row.id } ?: row else row
+                    }
+                    items = if (append && !restarted) {
                         val existing = baseline.map { it.threadId }.toSet()
-                        baseline.map { incoming[it.threadId] ?: it } + unique.filter { it.threadId !in existing }
-                    } else if (complete || incoming.keys.containsAll(known)) unique
-                    else unique + baseline.filter { it.threadId !in incoming }
+                        baseline + unique.filter { it.threadId !in existing }
+                    } else unique
                     next = cursor
-                    loadedPages = if (append) loadedPages + fetchedPages else fetchedPages
+                    loadedPages = if (append && !restarted) loadedPages + 1 else 1
+                    result.optJSONObject("sync")?.let { state ->
+                        indexVersion = state.optLong("indexVersion")
+                        historyComplete = state.optBoolean("historyComplete")
+                    }
                     paginationReady = true; localOnly = false
                     selected.retainAll(items.map { it.threadId }.toSet())
                     cacheCurrentList()
@@ -410,21 +402,25 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         }
     }
     private fun syncMailbox(manual: Boolean) {
-        if (active.isBlank() || syncing) return
+        if (active.isBlank()) return
+        syncJob?.cancel()
         val aid = active
         val auth = authGeneration
         val mailboxVersion = mailboxGeneration
         val chosenFolder = folder
-        val generation = listGeneration
         syncing = true; changed()
         syncJob = viewModelScope.launch {
             try {
                 ensureSession()
-                val result = api.json(path("/sync?folder=${enc(chosenFolder)}", aid), "POST")
-                if (auth == authGeneration && aid == active && mailboxVersion == mailboxGeneration) {
-                    if (manual) refreshLabels()
-                    if (generation == listGeneration && chosenFolder == folder &&
-                        (manual || result.optBoolean("changed") || result.optBoolean("reset"))) loadList(quiet = !manual)
+                api.json(path("/sync-jobs?folder=${enc(chosenFolder)}", aid), "POST")
+                while (isActive && auth == authGeneration && aid == active && mailboxVersion == mailboxGeneration && chosenFolder == folder) {
+                    val result = api.json(path("/sync-status?folder=${enc(chosenFolder)}", aid))
+                    if (auth != authGeneration || aid != active || mailboxVersion != mailboxGeneration || chosenFolder != folder) break
+                    historyComplete = result.optBoolean("historyComplete")
+                    if (result.optLong("indexVersion") != indexVersion) { loadList(quiet = true); refreshLabels() }
+                    syncing = result.str("status") in listOf("queued", "running", "retry")
+                    changed()
+                    delay(if (syncing) 2000 else 30000)
                 }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
@@ -446,9 +442,12 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         messages = result; changed()
         val unread = result.filter { "UNREAD" in it.labels }.map { it.id }
         if (unread.isNotEmpty()) {
-            api.json(path("/messages/modify", aid), "POST", obj("ids" to JSONArray(unread), "remove" to JSONArray(listOf("UNREAD"))))
-            if (generation != authGeneration || aid != active || requestGeneration != threadGeneration) return@coroutineScope
-            items.filter { it.threadId == tid }.forEach { it.raw.put("labels", JSONArray(it.labels - "UNREAD")) }; cacheCurrentList(); changed()
+            viewModelScope.launch {
+                if (generation == authGeneration && aid == active) {
+                    try { modify(remove=listOf("UNREAD"), ids=unread, threads=emptyList()) }
+                    catch(e: Exception) { fail(e) }
+                }
+            }
         }
     }
     suspend fun modify(add: List<String> = emptyList(), remove: List<String> = emptyList(), action: String = "labels", ids: List<String> = emptyList(), threads: List<String> = selected.toList()) {
@@ -456,8 +455,22 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         val aid = active
         val auth = authGeneration
         val mailboxVersion = mailboxGeneration
-        api.json(path("/messages/modify", aid), "POST", obj("ids" to JSONArray(ids), "threadIds" to JSONArray(if (ids.isEmpty()) threads else emptyList<String>()), "add" to JSONArray(add), "remove" to JSONArray(remove), "action" to action))
+        val keys = (if (ids.isEmpty()) threads else ids).map { "$aid:$it" }
+        if (keys.any { it in pendingMail }) return
+        pendingMail.addAll(keys)
+        val snapshots = (items + messages).filter { it.id in ids || it.threadId in threads }.associateWith { it.labels.toList() }
+        snapshots.forEach { (mail, before) -> mail.raw.put("labels", JSONArray((before - remove.toSet() + add).distinct())) }
+        changed()
+        val result = try {
+            api.json(path("/messages/modify", aid), "POST", obj("ids" to JSONArray(ids), "threadIds" to JSONArray(if (ids.isEmpty()) threads else emptyList<String>()), "add" to JSONArray(add), "remove" to JSONArray(remove), "action" to action))
+        } catch (e: Exception) {
+            if (aid == active && auth == authGeneration) snapshots.forEach { (mail, before) -> mail.raw.put("labels", JSONArray(before)) }
+            throw e
+        } finally { pendingMail.removeAll(keys.toSet()); changed() }
         if (aid != active || auth != authGeneration || mailboxVersion != mailboxGeneration) return
+        val failed = result.array("results").objects().filter { !it.optBoolean("ok") }.map { it.str("id") }.toSet()
+        snapshots.filter { (mail, _) -> mail.id in failed || mail.threadId in failed }.forEach { (mail, before) -> mail.raw.put("labels", JSONArray(before)) }
+        if (failed.isNotEmpty()) { cacheCurrentList(); changed(); throw java.io.IOException("部分邮件未能更新，请重试失败项") }
         messages.filter { ids.contains(it.id) || threads.contains(it.threadId) }.forEach { it.raw.put("labels", JSONArray((it.labels - remove.toSet() + add).distinct())) }
         // A confirmed write updates the local view before reconciliation; never delete the
         // entire local mailbox merely because a refresh could follow this operation.
@@ -474,7 +487,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
             if (leavesFolder) null else Mail(JSONObject(mail.raw.toString()).put("labels", JSONArray(updatedLabels)))
         }
         selected.clear(); cacheCurrentList(); changed()
-        loadList()
+        // Reconciliation is driven by the mailbox index version, not a blocking reload.
     }
     fun persistCompose() {
         val state = compose ?: return
@@ -509,7 +522,8 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         val generation = ++threadGeneration
         val auth = authGeneration
         val aid = active
-        val drafts = api.list(path("/drafts", aid))
+        val direct = mail.raw.str("draftId")
+        val drafts = if (direct.isNotBlank()) listOf(obj("id" to direct, "messageId" to mail.id)) else api.list(path("/drafts", aid))
         var found = drafts.find { it.str("messageId") == mail.id || it.str("id") == mail.id }
         if (found == null) for (draft in drafts) {
             if (api.json(path("/drafts/${enc(draft.str("id"))}", aid)).str("threadId") == mail.threadId) { found = draft; break }

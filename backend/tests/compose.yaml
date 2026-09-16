@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: isolated-test-only
+      POSTGRES_DB: test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test"]
+      interval: 1s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql
+  redis:
+    image: redis:7-alpine
+  tests:
+    image: hmail-concurrency-test
+    environment:
+      DATABASE_URL: postgresql+psycopg://test:isolated-test-only@db/test
+      PYTHONPATH: /app
+      PYTHONDONTWRITEBYTECODE: "1"
+      REDIS_URL: redis://redis:6379/0
+      TOKEN_ENCRYPTION_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
+    volumes:
+      - ..:/app:ro
+    command: ["python", "-m", "unittest", "discover", "-s", "tests", "-v"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started

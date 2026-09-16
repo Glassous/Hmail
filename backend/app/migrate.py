@@ -32,6 +32,14 @@ def migrate():
         if not conn.execute(text('SELECT version FROM schema_migrations WHERE version=2')).first():
             _upgrade_imap_secrets(conn)
             conn.execute(text('INSERT INTO schema_migrations(version) VALUES (2)'))
+        if not conn.execute(text('SELECT version FROM schema_migrations WHERE version=3')).first():
+            from sqlalchemy import inspect
+            columns = {column['name'] for column in inspect(conn).get_columns('gmail_accounts')}
+            for name, definition in [('credential_version', 'INTEGER NOT NULL DEFAULT 1'), ('write_revision', 'INTEGER NOT NULL DEFAULT 0'), ('accessed_at', 'FLOAT NOT NULL DEFAULT 0')]:
+                if name not in columns:
+                    conn.execute(text(f'ALTER TABLE gmail_accounts ADD COLUMN {name} {definition}'))
+            Base.metadata.create_all(conn)
+            conn.execute(text('INSERT INTO schema_migrations(version) VALUES (3)'))
 
 
 if __name__ == '__main__':

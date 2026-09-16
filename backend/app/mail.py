@@ -229,7 +229,8 @@ def build_message(sender, data, attachments):
 
 
 def recipients(data):
-    addresses = [a for _, a in getaddresses([data.get('to', ''), data.get('cc', ''), data.get('bcc', '')])]
+    fields = [data.get(name, '').strip() for name in ('to', 'cc', 'bcc') if data.get(name, '').strip()]
+    addresses = [a for _, a in getaddresses(fields)]
     if not addresses or any('@' not in a or '\r' in a or '\n' in a for a in addresses):
         raise MailError('请填写有效的收件人地址', 'validation', 422)
     return addresses

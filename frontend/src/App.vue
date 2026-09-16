@@ -10,7 +10,7 @@ type Account = {id:string; email:string; provider:string; status:string}
 type MailServer = {host:string; port:number; security:'ssl'|'starttls'}
 type MailPreset = {id:string; name:string; domains:string[]; imap:MailServer; smtp:MailServer; hint:string}
 type Attachment = {id:string; name:string; size:number; messageId?:string}
-type Mail = {id:string; threadId:string; from:string; to:string; cc:string; bcc:string; subject:string; snippet:string; date:string; labels:string[]; count?:number; text:string; html:string; messageId:string; references:string; attachments:Attachment[]}
+type Mail = {id:string; threadId:string; draftId?:string; from:string; to:string; cc:string; bcc:string; subject:string; snippet:string; date:string; labels:string[]; count?:number; text:string; html:string; messageId:string; references:string; attachments:Attachment[]}
 type Label = {id:string; name:string; type:string}
 const user = ref<any>(null), booting = ref(true), config = ref({oauthEnabled:false, emailCodeEnabled:false, maxAttachmentBytes:18874368, mailProviders:[] as MailPreset[]})
 const authMode = ref('login'), authBusy = ref(false), auth = reactive({email:'', password:'', code:''}), codeBusy = ref(false), codeSent = ref(false), codeCooldown = ref(0)
@@ -27,12 +27,17 @@ const composeStashed = ref(false)
 const composeVisible = computed(() => !!user.value && composer.value && !composeStashed.value)
 function restoreCompose() { sidebar.value=false; composeStashed.value=false }
 function stashCompose() {
-  if(uploading.value || composingBusy.value)return
   composeStashed.value=true
-  void saveDraft()
+  if(!uploading.value && !composingBusy.value)void saveDraft()
 }
 let saveTimer: ReturnType<typeof setTimeout> | undefined, toastTimer: ReturnType<typeof setTimeout> | undefined, codeTimer: ReturnType<typeof setInterval> | undefined
 let savePromise: Promise<void> | null = null, loadGeneration = 0, readGeneration = 0
+let listAbort: AbortController | undefined, readAbort: AbortController | undefined
+let syncTimer: ReturnType<typeof setTimeout> | undefined, syncGeneration = 0
+const historyComplete = ref(true), indexVersion = ref(0)
+const pendingActions = reactive(new Set<string>())
+const mutationVersions = new Map<string, number>()
+const aborted = (e:unknown) => e instanceof DOMException && e.name==='AbortError'
 const activeAccount = computed(() => accounts.value.find(a => a.id === activeId.value))
 const customLabels = computed(() => labels.value.filter(l => l.type === 'user'))
 const presetHint = computed(() => config.value.mailProviders.find(p => p.id === connection.provider)?.hint || (connection.provider === 'custom' ? '请向邮箱服务商确认 IMAP 与 SMTP 服务器地址、端口与加密方式。' : ''))
@@ -97,35 +102,75 @@ async function loadAccounts() {
   accounts.value=await api('/gmail-accounts')
   if(!accounts.value.some(a=>a.id===activeId.value)) activeId.value=accounts.value[0]?.id||''
 }
-watch(activeId, async () => { folder.value='INBOX'; query.value=''; appliedQuery.value=''; activeThread.value=''; messages.value=[]; labels.value=[]; items.value=[]; resetPages(); if(activeId.value) { try { labels.value=await api(path('/labels')); await loadList() } catch(e){fail(e)} } })
+watch(activeId, async () => {
+  listAbort?.abort(); readAbort?.abort(); ++loadGeneration; ++readGeneration; ++syncGeneration; clearTimeout(syncTimer)
+  reading.value=false; syncing.value=false; folder.value='INBOX'; query.value=''; appliedQuery.value=''; activeThread.value=''; messages.value=[]; labels.value=[]; items.value=[]; resetPages()
+  const aid=activeId.value
+  if(aid) {
+    await Promise.allSettled([loadList(), loadLabels(aid)])
+    if(aid===activeId.value)void refresh(false)
+  }
+})
+async function loadLabels(aid=activeId.value) { try { const result=await api<Label[]>(path('/labels',aid)); if(aid===activeId.value)labels.value=result }catch(e){if(aid===activeId.value)fail(e)} }
 function resetPages() { cursors.value=['']; pageIndex.value=0; nextCursor.value=''; selected.value=[] }
 async function loadList() {
   if(!activeId.value)return
-  const generation=++loadGeneration; loading.value=true; selected.value=[]
-  try { const result=await api(path('/threads')+'?'+new URLSearchParams({folder:folder.value,q:appliedQuery.value,cursor:cursors.value[pageIndex.value]||''})); if(generation!==loadGeneration)return; items.value=result.items; nextCursor.value=result.nextCursor }
-  catch(e){if(generation===loadGeneration)fail(e)} finally{if(generation===loadGeneration)loading.value=false}
+  listAbort?.abort(); listAbort=new AbortController()
+  const generation=++loadGeneration, aid=activeId.value, chosenFolder=folder.value; loading.value=true
+  try { const result=await api(path('/threads',aid)+'?'+new URLSearchParams({folder:chosenFolder,q:appliedQuery.value,cursor:cursors.value[pageIndex.value]||''}),'GET',undefined,listAbort.signal); if(generation!==loadGeneration||aid!==activeId.value||chosenFolder!==folder.value)return; items.value=result.items.map((item:Mail)=>pendingActions.has(aid+':'+item.id)?items.value.find(old=>old.id===item.id)||item:item); nextCursor.value=result.nextCursor; selected.value=selected.value.filter(id=>items.value.some(item=>item.id===id)); if(result.sync){historyComplete.value=result.sync.historyComplete;indexVersion.value=result.sync.indexVersion} }
+  catch(e){if(generation===loadGeneration&&!aborted(e)){if(e instanceof ApiError&&e.code==='cursor_expired'){resetPages();void loadList()}else fail(e)}} finally{if(generation===loadGeneration)loading.value=false}
 }
-async function chooseFolder(id:string) { folder.value=id; activeThread.value=''; messages.value=[]; sidebar.value=false; resetPages(); await loadList() }
-async function search() { appliedQuery.value=query.value.trim(); activeThread.value=''; resetPages(); await loadList() }
+async function chooseFolder(id:string) { readAbort?.abort();++readGeneration;reading.value=false;folder.value=id; activeThread.value=''; messages.value=[]; sidebar.value=false; resetPages(); await loadList();void refresh(false) }
+async function search() { readAbort?.abort();++readGeneration;reading.value=false;appliedQuery.value=query.value.trim(); activeThread.value=''; resetPages(); await loadList() }
 async function paginate(direction:number) { if(direction>0){cursors.value[pageIndex.value+1]=nextCursor.value;pageIndex.value++}else pageIndex.value--; await loadList() }
 async function refresh(manual=true) {
-  if(!activeId.value||syncing.value||loading.value||reading.value||composingBusy.value)return
-  syncing.value=true
-  try { await api(path('/sync')+'?folder='+encodeURIComponent(folder.value),'POST'); await loadList(); if(manual){labels.value=await api(path('/labels'));toast('邮箱已刷新')} }
-  catch(e){ if(manual)fail(e) }finally{syncing.value=false}
+  const aid=activeId.value, chosenFolder=folder.value, generation=++syncGeneration
+  if(!aid)return
+  clearTimeout(syncTimer);syncing.value=true
+  const current=()=>generation===syncGeneration&&aid===activeId.value&&chosenFolder===folder.value
+  const poll=async()=>{
+    if(!current())return
+    if(document.hidden){syncTimer=setTimeout(poll,2000);return}
+    try {
+      const status=await api(path('/sync-status',aid)+'?folder='+encodeURIComponent(chosenFolder))
+      if(!current())return
+      if(status.indexVersion!==indexVersion.value){resetPages();await Promise.allSettled([loadList(),loadLabels(aid)])}
+      if(!current())return
+      historyComplete.value=status.historyComplete
+      syncing.value=['queued','running','retry'].includes(status.status)
+      if(status.status==='failed'){syncing.value=false;if(manual)toast('同步暂时失败，已有邮件仍可阅读')}
+      if(status.status==='completed'&&manual){toast('邮箱已刷新');manual=false}
+      syncTimer=setTimeout(poll,syncing.value?2000:30000)
+    }catch(e){if(current()){syncing.value=false;if(manual)fail(e);syncTimer=setTimeout(poll,30000)}}
+  }
+  try { await api(path('/sync-jobs',aid)+'?folder='+encodeURIComponent(chosenFolder),'POST');if(current())void poll() }
+  catch(e){if(current()){syncing.value=false;if(manual)fail(e)}}
 }
 async function openMail(item:Mail) {
   if(folder.value==='DRAFT') { await openDraft(item); return }
-  const generation=++readGeneration; activeThread.value=item.threadId; reading.value=true; messages.value=[]
-  try { const data=await api<Mail[]>(path('/threads/'+encodeURIComponent(item.threadId))); if(generation!==readGeneration)return; messages.value=data; if(data.some(m=>m.labels.includes('UNREAD'))){await api(path('/messages/modify'),'POST',{ids:data.map(m=>m.id),remove:['UNREAD']});item.labels=item.labels.filter(l=>l!=='UNREAD')} }
-  catch(e){fail(e)}finally{if(generation===readGeneration)reading.value=false}
+  readAbort?.abort();readAbort=new AbortController()
+  const generation=++readGeneration,aid=activeId.value; activeThread.value=item.threadId; reading.value=true; messages.value=[]
+  try { const data=await api<Mail[]>(path('/threads/'+encodeURIComponent(item.threadId),aid),'GET',undefined,readAbort.signal); if(generation!==readGeneration||aid!==activeId.value||activeThread.value!==item.threadId)return; messages.value=data; reading.value=false; if(data.some(m=>m.labels.includes('UNREAD')))void modify([],['UNREAD'],'labels',data.map(m=>m.id)) }
+  catch(e){if(generation===readGeneration&&!aborted(e))fail(e)}finally{if(generation===readGeneration)reading.value=false}
 }
 async function modify(add:string[]=[],remove:string[]=[],action='labels',ids?:string[]) {
   const targets=ids|| (activeThread.value?messages.value.map(m=>m.id):selected.value)
   if(!targets.length)return
-  actionBusy.value=true
-  try { const threadIds=!ids&&!activeThread.value?items.value.filter(m=>selected.value.includes(m.id)).map(m=>m.threadId):[]; await api(path('/messages/modify'),'POST',{ids:threadIds.length?[]:targets,threadIds,add,remove,action}); toast('邮件已更新'); if(action!=='labels'||remove.includes('INBOX')){activeThread.value='';messages.value=[]}else messages.value.forEach(m=>{if(targets.includes(m.id))m.labels=[...new Set([...m.labels.filter(l=>!remove.includes(l)),...add])]}); await loadList() }
-  catch(e){fail(e)}finally{actionBusy.value=false}
+  const aid=activeId.value,chosenFolder=folder.value,thread=activeThread.value
+  const threadIds=!ids&&!thread?items.value.filter(m=>selected.value.includes(m.id)).map(m=>m.threadId):[]
+  const snapshots=new Map<Mail,string[]>(), versions=new Map<string,number>()
+  if(targets.some(target=>pendingActions.has(aid+':'+target)))return
+  for(const target of targets){const key=aid+':'+target;if(pendingActions.has(key))return;pendingActions.add(key);const v=(mutationVersions.get(key)||0)+1;mutationVersions.set(key,v);versions.set(key,v)}
+  for(const item of [...items.value,...messages.value])if(targets.includes(item.id)||threadIds.includes(item.threadId)){snapshots.set(item,[...item.labels]);item.labels=[...new Set([...item.labels.filter(l=>!remove.includes(l)),...add])]}
+  try {
+    const result=await api(path('/messages/modify',aid),'POST',{ids:threadIds.length?[]:targets,threadIds,add,remove,action})
+    if(aid!==activeId.value||chosenFolder!==folder.value)return
+    const failed=new Set<string>((result.results||[]).filter((r:any)=>!r.ok).map((r:any)=>r.id))
+    for(const [item,old]of snapshots)if(failed.has(item.id)||failed.has(item.threadId))item.labels=old
+    if(failed.size)toast('部分邮件未能更新，请重试失败项')
+    if(action!=='labels'||remove.includes(chosenFolder)){items.value=items.value.filter(item=>!snapshots.has(item)||failed.has(item.id)||failed.has(item.threadId));if(thread===activeThread.value&&!failed.size){activeThread.value='';messages.value=[]}}
+  }catch(e){if(aid===activeId.value){for(const [item,old]of snapshots)item.labels=old;fail(e)}}
+  finally{for(const [key,v]of versions)if(mutationVersions.get(key)===v)pendingActions.delete(key)}
 }
 async function star(item:Mail) { await modify(item.labels.includes('STARRED')?[]:['STARRED'],item.labels.includes('STARRED')?['STARRED']:[],'labels',[item.id]) }
 function checkAll() { selected.value=allChecked.value?[]:items.value.map(m=>m.id) }
@@ -205,10 +250,12 @@ async function openDraft(item:Mail) {
   if(composer.value){restoreCompose();toast('请先保存并关闭当前写信窗口');return}
   reading.value=true
   try{
-    const list=await api<any[]>(path('/drafts')); let found=list.find(d=>d.messageId===item.id||d.id===item.id)
+    const aid=activeId.value,generation=++readGeneration
+    const list=item.draftId?[]:await api<any[]>(path('/drafts',aid)); let found=item.draftId?{id:item.draftId}:list.find(d=>d.messageId===item.id||d.id===item.id)
     if(!found){for(const d of list){const content=await api<Mail>(path('/drafts/'+encodeURIComponent(d.id)));if(content.threadId===item.threadId){found=d;break}}}
     if(!found)throw new Error('未找到草稿，请刷新后重试')
-    const mail=await api<Mail>(path('/drafts/'+encodeURIComponent(found.id)))
+    const mail=await api<Mail>(path('/drafts/'+encodeURIComponent(found.id),aid))
+    if(aid!==activeId.value||generation!==readGeneration)return
     await newCompose();Object.assign(draft,{to:mail.to,cc:mail.cc,bcc:mail.bcc,subject:mail.subject==='(无主题)'?'':mail.subject,text:mail.text,draftId:found.id,threadId:mail.threadId,references:mail.references,attachments:mail.attachments.map(a=>({...a,messageId:mail.id}))});composeDirty.value=false;savedState.value='已载入草稿'
   }catch(e){fail(e)}finally{reading.value=false}
 }
@@ -260,6 +307,7 @@ onUnmounted(()=>{
   clearTimeout(saveTimer)
   clearTimeout(toastTimer)
   clearInterval(codeTimer)
+  clearTimeout(syncTimer);listAbort?.abort();readAbort?.abort();++syncGeneration
   systemMedia?.removeEventListener('change', applyTheme)
   window.removeEventListener('beforeunload', beforeUnload)
 })
@@ -352,7 +400,8 @@ onUnmounted(()=>{
             <span v-else class="ml-2 hidden text-sm font-medium sm:block">{{folderTitle}}</span>
             <div v-if="!activeThread" class="ml-auto flex shrink-0 items-center gap-1"><span class="mr-2 hidden text-xs text-slate-400 sm:inline">{{items.length?`第 ${pageIndex+1} 页 · ${items.length} 个会话`:'暂无邮件'}}</span><button class="icon-btn" :disabled="pageIndex===0||loading" aria-label="上一页" @click="paginate(-1)"><Icon name="chevron" :size="16" class="rotate-180"/></button><button class="icon-btn" :disabled="!nextCursor||loading" aria-label="下一页" @click="paginate(1)"><Icon name="chevron" :size="16"/></button></div>
           </div>
-          <div v-if="loading&&!activeThread||reading" class="flex flex-1 items-center justify-center gap-3 text-sm text-slate-400"><Icon name="refresh" class="animate-spin"/>正在从邮箱加载…</div>
+          <div v-if="!historyComplete" class="px-5 py-2 text-xs text-slate-400" role="status">正在同步历史邮件，已有邮件可正常阅读</div>
+          <div v-if="loading&&!items.length&&!activeThread||reading" class="flex flex-1 items-center justify-center gap-3 text-sm text-slate-400"><Icon name="refresh" class="animate-spin"/>正在加载邮件…</div>
           <div v-else-if="activeThread" class="flex-1 overflow-y-auto px-5 pb-10 sm:px-10"><h1 class="mb-6 mt-8 text-2xl font-medium leading-relaxed">{{messages[0]?.subject||'会话'}}</h1><article v-for="message in messages" :key="message.id" class="mb-5 border-b divider pb-6"><div class="flex items-start gap-3"><span class="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-blue-100 text-sm font-medium text-blue-700 dark:bg-blue-900/40 dark:text-blue-200">{{initials(message.from)}}</span><div class="min-w-0 flex-1"><div class="flex flex-wrap items-center gap-2"><span class="text-sm font-semibold">{{senderName(message.from)}}</span><span class="ml-auto text-xs text-slate-400">{{shortDate(message.date)}}</span><button class="icon-btn !h-8 !w-8" aria-label="切换星标" @click="star(message)"><Icon name="star" :size="17" :class="message.labels.includes('STARRED')?'fill-amber-400 text-amber-400':''"/></button></div><details class="text-xs text-slate-400"><summary class="cursor-pointer truncate">发送至 {{message.to}}</summary><div class="mt-2 space-y-1 break-all rounded-lg bg-slate-50 p-3 dark:bg-slate-800"><p>发件人：{{message.from}}</p><p>收件人：{{message.to}}</p><p v-if="message.cc">抄送：{{message.cc}}</p><p>{{message.date}}</p></div></details></div></div><div class="mt-5 sm:ml-13">                <div v-if="message.html" class="overflow-hidden rounded-xl border border-slate-200/80 bg-white shadow-sm dark:border-slate-700/60">
                   <iframe
                     :key="message.id + '-' + (message.html?.length || 0)"
@@ -415,7 +464,7 @@ onUnmounted(()=>{
   </div>
 
   <ComposeDialog :open="composeVisible" @stash="stashCompose">
-    <header class="flex shrink-0 flex-wrap items-center justify-between gap-y-2 bg-[#eaf0fa] px-5 py-3 dark:bg-slate-800"><h2 class="shrink-0 text-sm font-medium">新邮件</h2><span class="ml-auto mr-3 text-[11px] text-slate-400" aria-live="polite">{{savedState}}</span><button class="mr-3 rounded-lg px-2 py-1 text-xs text-blue-600 dark:text-blue-300" :disabled="composingBusy||uploading" @click="stashCompose">暂存</button><button class="text-slate-500" aria-label="保存并关闭" :disabled="composingBusy||uploading" @click="closeCompose"><Icon name="close" :size="18"/></button></header>
+    <header class="flex shrink-0 flex-wrap items-center justify-between gap-y-2 bg-[#eaf0fa] px-5 py-3 dark:bg-slate-800"><h2 class="shrink-0 text-sm font-medium">新邮件</h2><span class="ml-auto mr-3 text-[11px] text-slate-400" aria-live="polite">{{savedState}}</span><button class="mr-3 rounded-lg px-2 py-1 text-xs text-blue-600 dark:text-blue-300" @click="stashCompose">收起</button><button class="text-slate-500" aria-label="保存并关闭" :disabled="composingBusy||uploading" @click="closeCompose"><Icon name="close" :size="18"/></button></header>
     <form class="flex min-h-0 flex-1 flex-col" @submit.prevent="sendMail"><div class="min-h-0 overflow-y-auto px-5"><div class="border-b divider py-3 text-xs text-slate-400">发件人 <span class="ml-3 text-slate-600 dark:text-slate-300">{{accounts.find(a=>a.id===composeAccount)?.email}}</span></div><label v-for="field in (['to','cc','bcc'] as const)" :key="field" class="flex items-center border-b divider text-sm text-slate-400"><span class="w-14 shrink-0">{{field==='to'?'收件人':field==='cc'?'抄送':'密送'}}</span><input v-model="draft[field]" :disabled="sendUncertain" class="w-full bg-transparent py-3 text-slate-700 focus-visible:ring-0 dark:text-slate-200" :aria-label="field" @input="dirty"/></label><input v-model="draft.subject" :disabled="sendUncertain" class="w-full border-b divider bg-transparent py-3 text-sm focus-visible:ring-0" placeholder="主题" aria-label="邮件主题" @input="dirty"/><textarea v-model="draft.text" :disabled="sendUncertain" class="min-h-[240px] w-full resize-y bg-transparent py-4 text-sm leading-7 focus-visible:ring-0" placeholder="写下你的邮件…" aria-label="邮件正文" @input="dirty"></textarea><div class="mb-3 flex flex-wrap gap-2"><div v-for="(attachment,index) in draft.attachments" :key="attachment.id" class="flex max-w-full items-center gap-2 rounded-lg bg-slate-100 px-3 py-2 text-xs dark:bg-slate-800"><Icon name="attachment" :size="14"/><span class="max-w-[230px] truncate">{{attachment.name}}</span><span class="text-slate-400">{{sizeText(attachment.size)}}</span><button type="button" :disabled="sendUncertain" aria-label="移除附件" @click="draft.attachments.splice(index,1);dirty()"><Icon name="close" :size="13"/></button></div></div></div><p v-if="sendUncertain" class="mx-5 mb-3 rounded-lg bg-amber-50 p-3 text-xs leading-6 text-amber-700">发送结果待确认。请先查看已发送文件夹；此窗口已禁止再次发送。</p><footer class="flex shrink-0 flex-wrap items-center gap-3 border-t divider p-4"><button class="primary" :disabled="composingBusy||uploading||sendUncertain"><Icon name="send" :size="16"/>{{composingBusy?'处理中…':'发送'}}</button><label class="icon-btn cursor-pointer" aria-label="添加附件"><Icon :name="uploading?'refresh':'attachment'" :class="uploading?'animate-spin':''"/><input type="file" multiple class="sr-only" :disabled="composingBusy||uploading||sendUncertain" @change="uploadFiles"/></label><button type="button" class="text-xs text-slate-400" :disabled="composingBusy||uploading||sendUncertain" @click="saveDraft">保存草稿</button><button type="button" class="icon-btn ml-auto" :disabled="composingBusy||uploading" aria-label="丢弃草稿" @click="discardCompose"><Icon name="trash" :size="18"/></button></footer></form>
   </ComposeDialog>
   <button v-if="user && composer && composeStashed" class="compose-stash surface" aria-label="恢复暂存邮件" @click="restoreCompose">
