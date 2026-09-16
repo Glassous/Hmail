@@ -4,6 +4,7 @@ import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -74,6 +75,7 @@ val TopBarTopGap = 8.dp
  * - 页面在顶部（[collapse] 为 0）时标题位于第二行、字号更大、且正好落在导航按钮下方；
  * - 页面滚动时标题平滑折进顶栏，字号收敛到与折叠态一致的 16sp；
  * - 右侧每个操作项**各自独占一块玻璃**，数量多时横向滚动，导航块固定不动。
+ * - 需要把右侧整块区域交给页面自己编排时（例如原地展开的搜索框）传入 [trailing]。
  *
  * 非折叠页面不传 [collapse] 即可（默认恒为 1，即紧凑态）。
  */
@@ -87,6 +89,8 @@ fun GlassTopBar(
     navigationDescription: String = "打开侧栏",
     onNavigationClick: (() -> Unit)? = null,
     actions: List<GlassAction> = emptyList(),
+    /** 自定义右侧区域（标题块以右、页边距以左）；非空时 [actions] 被忽略。 */
+    trailing: (@Composable BoxScope.() -> Unit)? = null,
     topPadding: Dp = 0.dp
 ) {
     val onBackground = MaterialTheme.colorScheme.onBackground
@@ -105,16 +109,25 @@ fun GlassTopBar(
         )
         Spacer(Modifier.width(BlockGap))
         Box(Modifier.weight(1f)) {
-            Row(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(BlockGap),
-                verticalAlignment = Alignment.Top
-            ) {
-                actions.forEach { action -> GlassActionBlock(backdrop, action) }
+            val custom = trailing
+            if (custom != null) {
+                custom()
+            } else {
+                GlassActionsRow(backdrop, actions, Modifier.align(Alignment.TopEnd))
             }
         }
+    }
+}
+
+/** 顶栏右侧的操作项：右对齐，数量超出可横向滚动；[GlassTopBar] 与自定义右侧区域共用。 */
+@Composable
+fun GlassActionsRow(backdrop: Backdrop, actions: List<GlassAction>, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier.horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(BlockGap),
+        verticalAlignment = Alignment.Top
+    ) {
+        actions.forEach { action -> GlassActionBlock(backdrop, action) }
     }
 }
 

@@ -130,6 +130,9 @@ fun GlassPill(
     backdrop: Backdrop,
     modifier: Modifier = Modifier,
     shape: Shape = RoundedCornerShape(percent = 50),
+    /** 遮罩颜色，默认取主题玻璃色；传入实色可让玻璃与卡片同色，形变与模糊不受影响。 */
+    tint: Color = HmailTheme.colors.glassTint,
+    tintAlpha: Float = HmailTheme.colors.glassTintAlpha,
     enabled: Boolean = true,
     onClick: (() -> Unit)? = null,
     content: @Composable RowScope.() -> Unit
@@ -138,6 +141,8 @@ fun GlassPill(
         backdrop = backdrop,
         modifier = modifier,
         shape = shape,
+        tint = tint,
+        tintAlpha = tintAlpha,
         enabled = enabled,
         onClick = onClick
     ) {

@@ -158,15 +158,11 @@ fun HmailApp(model: MailModel, activity: ComponentActivity) {
                         InboxScreen(
                             model = model,
                             onOpenDrawer = { scope.launch { drawerState.open() } },
-                            onSearch = { navController.navigate(Routes.Search) },
                             onOpenThread = { account, thread -> navController.navigate(Routes.thread(account, thread)) },
                             onCompose = { navController.navigate(Routes.Compose) },
                             onConnect = { navController.navigate(Routes.Connect) },
                             onLabelPick = { navController.navigate(Routes.labelPick("")) }
                         )
-                    }
-                    composable(Routes.Search) {
-                        SearchScreen(model) { navController.popBackStack() }
                     }
                     composable(
                         route = Routes.Thread,

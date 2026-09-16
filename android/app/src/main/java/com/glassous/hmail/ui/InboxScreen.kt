@@ -1,8 +1,11 @@
 package com.glassous.hmail.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.core.MutableTransitionState
@@ -28,6 +31,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -43,9 +49,14 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -56,6 +67,7 @@ import com.glassous.hmail.folders
 import com.glassous.hmail.shortDate
 import com.glassous.hmail.str
 import com.glassous.hmail.ui.common.GlassAction
+import com.glassous.hmail.ui.common.GlassActionsRow
 import com.glassous.hmail.ui.common.GlassTopBar
 import com.glassous.hmail.ui.common.SelectionActionCard
 import com.glassous.hmail.ui.common.TopBarCollapsedHeight
@@ -68,6 +80,7 @@ import com.glassous.hmail.ui.glass.GlassPill
 import com.glassous.hmail.ui.glass.glassSource
 import com.glassous.hmail.ui.glass.rememberGlassBackdrop
 import com.glassous.hmail.ui.theme.HmailTheme
+import com.kyant.backdrop.Backdrop
 import kotlinx.coroutines.delay
 
 private val BlockGap = 12.dp
@@ -85,7 +98,6 @@ private class AnimatedMailEntry(mail: Mail, initiallyVisible: Boolean = false) {
 fun InboxScreen(
     model: MailModel,
     onOpenDrawer: () -> Unit,
-    onSearch: () -> Unit,
     onOpenThread: (String, String) -> Unit,
     onCompose: () -> Unit,
     onConnect: () -> Unit,
@@ -95,6 +107,37 @@ fun InboxScreen(
     val mails = remember(revision) { model.items.toList() }
     val selected = remember(revision) { model.selected.toSet() }
     var cardOpen by remember(model.active, model.folder, model.query, selected.isNotEmpty()) { mutableStateOf(false) }
+
+    // 搜索不跳独立页面：顶栏的搜索按钮原地展开成长输入框，提交后仍在主页出结果。
+    var searchOpen by remember { mutableStateOf(false) }
+    var searchText by remember { mutableStateOf("") }
+    val searchFocus = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
+    fun closeSearch() {
+        searchOpen = false
+        searchText = ""
+        focusManager.clearFocus()
+        // 正在看搜索结果时，退出搜索即回到普通列表（旧流程没有这条退路）。
+        if (model.query.isNotBlank()) model.search("")
+    }
+    fun submitSearch(value: String) {
+        val keyword = value.trim()
+        searchOpen = false
+        searchText = ""
+        focusManager.clearFocus()
+        if (keyword.isEmpty()) {
+            if (model.query.isNotBlank()) model.search("")
+        } else {
+            model.search(keyword)
+        }
+    }
+    LaunchedEffect(searchOpen) {
+        if (!searchOpen) return@LaunchedEffect
+        // 等展开动画把输入框挂进组合后再抢焦点，避免 FocusRequester 尚未初始化。
+        delay(160)
+        searchFocus.requestFocus()
+    }
+    BackHandler(enabled = searchOpen) { closeSearch() }
     val listState = rememberLazyListState(model.listPosition, model.listOffset)
     var animatedMails by remember(model.active, model.folder, model.query) {
         // Initial local content is immediately visible. Only later diffs animate.
@@ -156,6 +199,22 @@ fun InboxScreen(
                 model.listOffset = offset
             }
     }
+    // "写邮件"随滚动方向开合：向下滚只留图标，向上滚重新展开文字。
+    var composeExpanded by remember { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        var previous = listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+        snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+            .collect { current ->
+                if (current == previous) return@collect
+                val downwards = if (current.first == previous.first) {
+                    current.second > previous.second
+                } else {
+                    current.first > previous.first
+                }
+                previous = current
+                composeExpanded = !downwards
+            }
+    }
     // 切换文件夹、账号或搜索词后回到列表顶部；追加邮件保留当前位置；首次进入沿用恢复出的位置。
     var restored by remember { mutableStateOf(false) }
     LaunchedEffect(model.active, model.folder, model.query) {
@@ -195,7 +254,10 @@ fun InboxScreen(
     )
 
     val topActions = if (selected.isEmpty()) listOf(
-        GlassAction("搜索", "search") { onSearch() },
+        GlassAction("搜索", "search") {
+            searchText = model.query
+            searchOpen = true
+        },
         GlassAction("刷新", "refresh", enabled = !model.loading && !model.syncing) { model.loadList(sync = true) }
     ) else listOf(
         GlassAction("更多操作", "more") { cardOpen = !cardOpen }
@@ -327,10 +389,41 @@ fun InboxScreen(
             backdrop = backdrop,
             title = title,
             collapse = collapse,
-            actions = topActions,
             onNavigationClick = onOpenDrawer,
             topPadding = barTop,
-            modifier = Modifier.align(Alignment.TopStart)
+            modifier = Modifier.align(Alignment.TopStart),
+            trailing = {
+                // 常规操作项与展开的搜索框在同一块区域互换；搜索框贴着右边缘向左生长。
+                AnimatedVisibility(
+                    visible = !searchOpen,
+                    modifier = Modifier.align(Alignment.TopEnd),
+                    enter = fadeIn(tween(160)),
+                    exit = fadeOut(tween(100))
+                ) {
+                    GlassActionsRow(backdrop, topActions)
+                }
+                AnimatedVisibility(
+                    visible = searchOpen,
+                    modifier = Modifier.align(Alignment.TopEnd),
+                    enter = fadeIn(tween(160)) + expandHorizontally(
+                        tween(240, easing = FastOutSlowInEasing),
+                        expandFrom = Alignment.End
+                    ),
+                    exit = fadeOut(tween(120)) + shrinkHorizontally(
+                        tween(200, easing = FastOutSlowInEasing),
+                        shrinkTowards = Alignment.End
+                    )
+                ) {
+                    SearchBar(
+                        backdrop = backdrop,
+                        value = searchText,
+                        onValueChange = { searchText = it },
+                        onSubmit = { submitSearch(searchText) },
+                        onClose = { closeSearch() },
+                        focusRequester = searchFocus
+                    )
+                }
+            }
         )
 
         Column(
@@ -357,6 +450,8 @@ fun InboxScreen(
             GlassPill(
                 backdrop = backdrop,
                 modifier = Modifier.height(FabHeight),
+                // 只换遮罩颜色：模糊、折射与按压的明暗过渡仍由玻璃本身提供。
+                tint = HmailTheme.card,
                 onClick = {
                     if (model.active.isBlank()) onConnect()
                     else {
@@ -366,8 +461,20 @@ fun InboxScreen(
                 }
             ) {
                 MailIcon("edit", tint = MaterialTheme.colorScheme.onBackground)
-                Spacer(Modifier.width(8.dp))
-                Text("写邮件", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onBackground)
+                AnimatedVisibility(
+                    visible = composeExpanded,
+                    enter = fadeIn(tween(180)) + expandHorizontally(tween(220), expandFrom = Alignment.Start),
+                    exit = fadeOut(tween(140)) + shrinkHorizontally(tween(200), shrinkTowards = Alignment.Start)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "写邮件",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                    }
+                }
             }
         }
 
@@ -467,6 +574,47 @@ private fun MailRow(
         }
         IconButton(onClick = onStar, enabled = enabled, modifier = Modifier.size(48.dp)) {
             MailIcon("star", contentDescription = "切换星标", tint = if (starred) colors.star else colors.muted)
+        }
+    }
+}
+
+/** 主页顶栏里原地展开的搜索框：与顶栏同材质的玻璃胶囊，键盘搜索键即提交。 */
+@Composable
+private fun SearchBar(
+    backdrop: Backdrop,
+    value: String,
+    onValueChange: (String) -> Unit,
+    onSubmit: () -> Unit,
+    onClose: () -> Unit,
+    focusRequester: FocusRequester
+) {
+    val foreground = MaterialTheme.colorScheme.onBackground
+    GlassPill(
+        backdrop = backdrop,
+        modifier = Modifier.fillMaxWidth().height(TopBarCollapsedHeight),
+        // 胶囊任意位置都能把焦点交回输入框。
+        onClick = { focusRequester.requestFocus() }
+    ) {
+        MailIcon("search", tint = foreground)
+        Spacer(Modifier.width(8.dp))
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.weight(1f).focusRequester(focusRequester),
+            singleLine = true,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = foreground),
+            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+            keyboardActions = KeyboardActions(onSearch = { onSubmit() }),
+            decorationBox = { inner ->
+                if (value.isEmpty()) {
+                    Text("搜索邮件", style = MaterialTheme.typography.bodyLarge, color = HmailTheme.colors.muted)
+                }
+                inner()
+            }
+        )
+        IconButton(onClick = onClose, modifier = Modifier.size(40.dp)) {
+            MailIcon("close", contentDescription = "退出搜索", tint = foreground)
         }
     }
 }

@@ -6,7 +6,6 @@ object Routes {
     const val Register = "register"
     const val Reset = "reset"
     const val Inbox = "inbox"
-    const val Search = "search"
     const val Compose = "compose"
     const val Accounts = "accounts"
     const val Connect = "connect"
