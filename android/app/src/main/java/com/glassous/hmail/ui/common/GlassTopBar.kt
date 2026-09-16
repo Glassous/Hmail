@@ -45,6 +45,8 @@ data class GlassAction(
     val label: String,
     val icon: String? = null,
     val enabled: Boolean = true,
+    /** 图标着色；为 null 时跟随页面前景色。用于星标这类需要区分开关态的图标。 */
+    val tint: Color? = null,
     val onClick: () -> Unit
 )
 
@@ -232,7 +234,7 @@ private fun GlassActionBlock(backdrop: Backdrop, action: GlassAction) {
                 action.icon,
                 contentDescription = action.label,
                 modifier = Modifier.align(Alignment.Center),
-                tint = MaterialTheme.colorScheme.onBackground
+                tint = action.tint ?: MaterialTheme.colorScheme.onBackground
             )
         }
     } else {

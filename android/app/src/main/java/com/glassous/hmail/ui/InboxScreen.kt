@@ -266,6 +266,10 @@ fun InboxScreen(
         GlassAction("标签") { onLabelPick() }
     )
 
+    // 选中项的星标状态：全部已加星时按钮转为"取消星标"，否则统一加星。
+    val selectedMails = mails.filter { it.threadId in selected }
+    val allStarred = selectedMails.isNotEmpty() && selectedMails.all { "STARRED" in it.labels }
+
     val topActions = if (selected.isEmpty()) listOf(
         GlassAction("搜索", "search") {
             searchText = model.query
@@ -273,6 +277,20 @@ fun InboxScreen(
         },
         GlassAction("刷新", "refresh", enabled = !model.loading && !model.syncing) { model.loadList(sync = true) }
     ) else listOf(
+        // 星标按钮排在三点菜单左边，只作用于选中的邮件。
+        GlassAction(
+            label = if (allStarred) "取消星标" else "添加星标",
+            icon = "star",
+            enabled = !model.busy,
+            tint = if (allStarred) colors.star else colors.muted
+        ) {
+            model.work {
+                model.modify(
+                    add = if (allStarred) emptyList() else listOf("STARRED"),
+                    remove = if (allStarred) listOf("STARRED") else emptyList()
+                )
+            }
+        },
         GlassAction("更多操作", "more") { cardOpen = !cardOpen }
     )
 
@@ -320,7 +338,6 @@ fun InboxScreen(
                             checked = mail.threadId in selected,
                             anySelected = selected.isNotEmpty(),
                             unread = "UNREAD" in mail.labels,
-                            starred = "STARRED" in mail.labels,
                             sender = mail.from.substringBefore('<').replace("\"", "").trim().ifBlank { mail.from },
                             count = mail.raw.optInt("count", 1),
                             subject = mail.subject,
@@ -341,16 +358,6 @@ fun InboxScreen(
                                         model.messages = emptyList()
                                         onOpenThread(model.active, mail.threadId)
                                     }
-                                }
-                            },
-                            onStar = {
-                                val starred = "STARRED" in mail.labels
-                                model.work {
-                                    model.modify(
-                                        add = if (starred) emptyList() else listOf("STARRED"),
-                                        remove = if (starred) listOf("STARRED") else emptyList(),
-                                        ids = listOf(mail.id)
-                                    )
                                 }
                             }
                         )
@@ -532,15 +539,13 @@ private fun MailRow(
     checked: Boolean,
     anySelected: Boolean,
     unread: Boolean,
-    starred: Boolean,
     sender: String,
     count: Int,
     subject: String,
     snippet: String,
     date: String,
     onToggle: () -> Unit,
-    onOpen: () -> Unit,
-    onStar: () -> Unit
+    onOpen: () -> Unit
 ) {
     val colors = HmailTheme.colors
     val weight = if (unread) FontWeight.Bold else FontWeight.Normal
@@ -554,7 +559,7 @@ private fun MailRow(
                 onClick = { if (anySelected) onToggle() else onOpen() },
                 onLongClick = onToggle
             )
-            .padding(start = 16.dp, end = 4.dp, top = 14.dp, bottom = 14.dp),
+            .padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 14.dp),
         verticalAlignment = Alignment.Top
     ) {
         Box(
@@ -600,9 +605,6 @@ private fun MailRow(
                 fontSize = 13.sp,
                 color = colors.muted
             )
-        }
-        IconButton(onClick = onStar, enabled = enabled, modifier = Modifier.size(48.dp)) {
-            MailIcon("star", contentDescription = "切换星标", tint = if (starred) colors.star else colors.muted)
         }
     }
 }

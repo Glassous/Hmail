@@ -24,7 +24,7 @@
 | Google 连接 | 移动端授权接口，见下节 | 连接邮箱 → 使用 Google 连接 |
 | 文件夹、查询、分页 | GET `/gmail-accounts/{aid}/threads` | 邮件首页、搜索 |
 | 手动刷新、冷启动同步 | POST `/gmail-accounts/{aid}/sync` | 顶栏刷新；冷启动恢复会话时同步一次 |
-| 会话、已读、星标 | GET `/gmail-accounts/{aid}/threads/{tid}`，POST `…/messages/modify` | 阅读页、列表星标 |
+| 会话、已读、星标 | GET `/gmail-accounts/{aid}/threads/{tid}`，POST `…/messages/modify` | 阅读页、选中后顶栏星标 |
 | 归档、垃圾邮件、回收站、恢复、读/未读、批量操作 | POST `…/messages/modify` | 长按/头像多选、更多菜单 |
 | 标签新建、重命名、删除 | GET/POST `…/labels` | 侧栏 → 管理标签 |
 | 标签应用与移除 | POST `…/messages/modify` | 选择标签页 |
