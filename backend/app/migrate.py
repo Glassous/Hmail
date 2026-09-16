@@ -40,6 +40,12 @@ def migrate():
                     conn.execute(text(f'ALTER TABLE gmail_accounts ADD COLUMN {name} {definition}'))
             Base.metadata.create_all(conn)
             conn.execute(text('INSERT INTO schema_migrations(version) VALUES (3)'))
+        if not conn.execute(text('SELECT version FROM schema_migrations WHERE version=4')).first():
+            from sqlalchemy import inspect
+            columns = {column['name'] for column in inspect(conn).get_columns('users')}
+            if 'default_account_id' not in columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN default_account_id VARCHAR(36) NOT NULL DEFAULT ''"))
+            conn.execute(text('INSERT INTO schema_migrations(version) VALUES (4)'))
 
 
 if __name__ == '__main__':

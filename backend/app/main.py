@@ -295,8 +295,8 @@ def account_for(user, aid):
     return account
 
 
-def account_view(account):
-    return {'id': account.id, 'email': account.email, 'provider': account.provider, 'status': account.status}
+def account_view(account, default_id=''):
+    return {'id': account.id, 'email': account.email, 'provider': account.provider, 'status': account.status, 'isDefault': account.id == default_id}
 
 
 def invalidate(user_id, aid):
@@ -356,6 +356,11 @@ def save_account(user, email, kind, secret):
                 account.provider, account.secret, account.status, account.sync_state = kind, encrypt(secret), 'connected', '{}'
                 account.credential_version += 1
                 indexing.clear_account(db, account.id)
+                default_id = user.default_account_id
+                if not default_id:
+                    # 首个连接的邮箱自动成为默认邮箱，用户之后可随时更改。
+                    default_id = account.id
+                    db.get(User, user.id).default_account_id = default_id
                 db.commit()
                 invalidate(user.id, account.id)
                 discard_account(account.id)
@@ -366,15 +371,36 @@ def save_account(user, email, kind, secret):
                 db.commit()
             except IntegrityError:
                 raise MailError('此邮箱已连接，请刷新', 'conflict', 409) from None
+            default_id = user.default_account_id
+            if not default_id:
+                default_id = account.id
+                db.get(User, user.id).default_account_id = default_id
+                db.commit()
     if indexing.ENABLED:
         indexing.enqueue(account.id, 'INBOX', 20)
-    return account_view(account)
+    return account_view(account, default_id)
 
 
 @app.get(PREFIX + '/gmail-accounts')
 def accounts(user=Depends(current_user)):
     with Session() as db:
-        return [account_view(a) for a in db.scalars(select(Account).where(Account.user_id == user.id))]
+        return [account_view(a, user.default_account_id) for a in db.scalars(select(Account).where(Account.user_id == user.id))]
+
+
+class DefaultAccount(BaseModel):
+    accountId: str = Field(default='', max_length=36)
+
+
+@app.put(PREFIX + '/me/default-account')
+def set_default_account(data: DefaultAccount, user=Depends(current_user)):
+    """记住默认邮箱；accountId 传空字符串表示取消默认。"""
+    if data.accountId:
+        account_for(user, data.accountId)
+    with Session() as db:
+        stored = db.get(User, user.id)
+        stored.default_account_id = data.accountId
+        db.commit()
+    return {'ok': True, 'defaultAccountId': data.accountId}
 
 
 HOST_PATTERN = re.compile(r'^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$')
@@ -577,6 +603,9 @@ def disconnect(aid: str, user=Depends(current_user)):
             indexing.clear_account(db, aid)
             db.execute(delete(ComposeOperation).where(ComposeOperation.account_id == aid))
             db.execute(delete(Account).where(Account.id == aid, Account.user_id == user.id))
+            if user.default_account_id == aid:
+                store = db.get(User, user.id)
+                store.default_account_id = ''
             db.commit()
         invalidate(user.id, aid)
         discard_account(aid)

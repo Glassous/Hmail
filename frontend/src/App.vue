@@ -6,7 +6,7 @@ import MailboxPicker from './MailboxPicker.vue'
 import ComposeDialog from './ComposeDialog.vue'
 import { api, ApiError, setCsrf } from './api'
 
-type Account = {id:string; email:string; provider:string; status:string}
+type Account = {id:string; email:string; provider:string; status:string; isDefault?:boolean}
 type MailServer = {host:string; port:number; security:'ssl'|'starttls'}
 type MailPreset = {id:string; name:string; domains:string[]; imap:MailServer; smtp:MailServer; hint:string}
 type Attachment = {id:string; name:string; size:number; messageId?:string}
@@ -19,6 +19,7 @@ const items = ref<Mail[]>([]), messages = ref<Mail[]>([]), selected = ref<string
 const loading = ref(false), reading = ref(false), syncing = ref(false), sidebar = ref(false), modal = ref(''), error = ref(''), notice = ref(''), theme = ref<'system'|'light'|'dark'>((localStorage.getItem('hmail-theme') as 'system'|'light'|'dark') || 'system')
 const connectionBusy = ref(false), changingPassword = reactive({currentPassword:'',password:''})
 const connection = reactive({email:'',password:'',provider:'',imapHost:'',imapPort:993,imapSecurity:'ssl',smtpHost:'',smtpPort:465,smtpSecurity:'ssl'})
+const connectMode = ref<'choose'|'imap'>('choose')
 const labelName = ref(''), labelEdit = ref<Label|null>(null), labelChoice = ref(''), actionBusy = ref(false)
 const composer = ref(false), composeAccount = ref(''), composingBusy = ref(false), uploading = ref(false), savedState = ref(''), composeDirty = ref(false), sendUncertain = ref(false)
 const freshCompose = () => ({to:'',cc:'',bcc:'',subject:'',text:'',inReplyTo:'',references:'',threadId:null as string|null,draftId:null as string|null,composeId:crypto.randomUUID(),version:0,attachments:[] as Attachment[]})
@@ -100,7 +101,7 @@ function switchAuth(mode:string) { authMode.value=mode; auth.password=''; auth.c
 async function logout() { try { await closeCompose(); if(composer.value)return; await api('/auth/logout','POST'); user.value=null; accounts.value=[]; activeId.value=''; modal.value=''; setCsrf('') } catch(e){fail(e)} }
 async function loadAccounts() {
   accounts.value=await api('/gmail-accounts')
-  if(!accounts.value.some(a=>a.id===activeId.value)) activeId.value=accounts.value[0]?.id||''
+  if(!accounts.value.some(a=>a.id===activeId.value)) activeId.value=accounts.value.find(a=>a.isDefault)?.id||accounts.value[0]?.id||''
 }
 watch(activeId, async () => {
   listAbort?.abort(); readAbort?.abort(); ++loadGeneration; ++readGeneration; ++syncGeneration; clearTimeout(syncTimer)
@@ -216,13 +217,20 @@ function detectProvider() {
   const preset=config.value.mailProviders.find(p=>p.domains.includes(domain))
   if(preset)applyPreset(preset.id)
 }
-function openConnect() { modal.value='connect';connection.password='';connection.provider='';connection.imapHost='';connection.smtpHost='';connection.imapPort=993;connection.smtpPort=465;connection.imapSecurity='ssl';connection.smtpSecurity='ssl';detectProvider() }
+function openConnect() { modal.value='connect';connectMode.value='choose';connection.password='';connection.provider='';connection.imapHost='';connection.smtpHost='';connection.imapPort=993;connection.smtpPort=465;connection.imapSecurity='ssl';connection.smtpSecurity='ssl';detectProvider() }
 async function imapConnect() {
   connectionBusy.value=true
   try {
     const account=await api('/gmail-accounts/imap','POST',{email:connection.email,password:connection.password,imapHost:connection.imapHost,imapPort:connection.imapPort,imapSecurity:connection.imapSecurity,smtpHost:connection.smtpHost,smtpPort:connection.smtpPort,smtpSecurity:connection.smtpSecurity})
     connection.password='';modal.value='';await loadAccounts();activeId.value=account.id;toast('邮箱已连接')
   } catch(e){fail(e)} finally{connectionBusy.value=false}
+}
+async function setDefaultAccount(account:Account) {
+  try {
+    await api('/me/default-account','PUT',{accountId:account.isDefault?'':account.id})
+    await loadAccounts()
+    toast(account.isDefault?'已取消默认邮箱':'已将 '+account.email+' 设为默认邮箱')
+  } catch(e){fail(e)}
 }
 async function disconnect(account:Account) { if(!confirm(`断开 ${account.email}？邮箱中的邮件将保留。`))return;try{await api('/gmail-accounts/'+account.id,'DELETE');await loadAccounts();toast('已断开连接')}catch(e){fail(e)} }
 async function changePassword() { try{await api('/me/password','POST',{currentPassword:changingPassword.currentPassword,password:changingPassword.password});changingPassword.currentPassword='';changingPassword.password='';user.value=null;modal.value='';setCsrf('');toast('密码已修改，请重新登录')}catch(e){fail(e)} }
@@ -423,41 +431,57 @@ onUnmounted(()=>{
   </div>
 
   <div v-if="modal" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4 backdrop-blur-sm" @click.self="modal=''">
-    <section class="surface max-h-[90dvh] w-full max-w-lg overflow-y-auto rounded-3xl p-7 shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="mb-6 flex items-center justify-between"><h2 id="modal-title" class="text-xl font-semibold">{{modal==='connect'?'连接邮箱':modal==='settings'?'账户设置':modal==='label'?'管理标签':'应用标签'}}</h2><button class="icon-btn !h-8 !w-8" aria-label="关闭弹窗" @click="modal=''"><Icon name="close" :size="19"/></button></div>
+    <section class="surface max-h-[90dvh] w-full overflow-y-auto rounded-3xl p-7 shadow-2xl" :class="modal==='connect'?'max-w-3xl':'max-w-lg'" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="mb-6 flex items-center justify-between"><h2 id="modal-title" class="text-xl font-semibold">{{modal==='connect'?'连接邮箱':modal==='settings'?'账户设置':modal==='label'?'管理标签':'应用标签'}}</h2><button class="icon-btn !h-8 !w-8" aria-label="关闭弹窗" @click="modal=''"><Icon name="close" :size="19"/></button></div>
       <template v-if="modal==='connect'">
-        <p class="mb-6 text-sm leading-6 text-slate-500">选择连接方式。已连接的邮箱会更新凭据或切换连接方式，邮件仍保留在原来的邮箱服务商。</p>
-        <button class="flex w-full items-center gap-4 rounded-2xl border border-blue-200 bg-blue-50 p-5 text-left dark:border-blue-900 dark:bg-blue-900/20" :disabled="!config.oauthEnabled||connectionBusy" @click="oauthConnect"><span class="flex h-10 w-10 items-center justify-center rounded-full bg-white text-lg font-semibold text-blue-600">G</span><span><span class="block text-sm font-semibold">使用 Google 连接</span><span class="mt-1 block text-xs text-slate-500">Gmail OAuth 授权 · 推荐方式</span></span><Icon name="chevron" class="ml-auto" :size="18"/></button>
-        <p v-if="!config.oauthEnabled" class="mt-3 text-xs leading-6 text-amber-600">尚未配置 Google OAuth。可在本地环境文件中配置，或直接使用下方的 IMAP＋SMTP 连接。</p>
-        <div class="mt-7 border-t divider pt-6">
-          <h3 class="text-sm font-medium">使用 IMAP＋SMTP 连接</h3>
+        <template v-if="connectMode==='choose'">
+          <p class="mb-6 text-sm leading-6 text-slate-500">选择连接方式。已连接的邮箱会更新凭据或切换连接方式，邮件仍保留在原来的邮箱服务商。</p>
+          <div class="grid gap-4 sm:grid-cols-2">
+            <button class="flex w-full flex-col items-start gap-4 rounded-2xl border border-slate-200 p-6 text-left transition hover:border-blue-400 hover:shadow-lg hover:shadow-blue-500/10 dark:border-slate-700 dark:hover:border-blue-500" :disabled="!config.oauthEnabled||connectionBusy" @click="oauthConnect">
+              <img src="/google-icon.svg" alt="" class="h-9 w-9" :class="connectionBusy?'animate-pulse':''"/>
+              <span class="block text-sm font-semibold">使用 Google 连接</span>
+            </button>
+            <button class="flex w-full flex-col items-start gap-4 rounded-2xl border border-slate-200 p-6 text-left transition hover:border-blue-400 hover:shadow-lg hover:shadow-blue-500/10 dark:border-slate-700 dark:hover:border-blue-500" :disabled="connectionBusy" @click="connectMode='imap'">
+              <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-blue-50 text-blue-600 dark:bg-blue-900/40 dark:text-blue-300"><Icon name="mail" :size="20"/></span>
+              <span class="block text-sm font-semibold">使用 IMAP＋SMTP 连接</span>
+            </button>
+          </div>
+          <p v-if="!config.oauthEnabled" class="mt-4 text-xs leading-6 text-amber-600">尚未配置 Google OAuth。可在本地环境文件中配置，或使用 IMAP＋SMTP 连接。</p>
+        </template>
+        <template v-else>
+          <button class="mb-5 inline-flex items-center gap-1.5 text-xs text-slate-500 transition hover:text-blue-600" @click="connectMode='choose'"><Icon name="back" :size="15"/>返回选择其他连接方式</button>
+          <h3 class="text-base font-semibold">使用 IMAP＋SMTP 连接</h3>
           <p class="mt-2 text-xs leading-6 text-slate-400">支持任意开启 IMAP 与 SMTP 服务的邮箱。选择服务商会自动填充服务器，也可以手动改成自定义服务器。</p>
-          <form class="mt-4 space-y-4" @submit.prevent="imapConnect">
-            <label class="block text-xs">邮箱地址<input v-model="connection.email" type="email" required maxlength="254" class="field mt-2" placeholder="you@example.com" autocomplete="email" @input="detectProvider"/></label>
-            <label class="block text-xs">密码 / 授权码<input v-model="connection.password" type="password" required minlength="1" maxlength="256" class="field mt-2" placeholder="邮箱密码或客户端授权码" autocomplete="off"/></label>
+          <form class="mt-5 space-y-5" @submit.prevent="imapConnect">
+            <div class="grid gap-4 sm:grid-cols-2">
+              <label class="block text-xs">邮箱地址<input v-model="connection.email" type="email" required maxlength="254" class="field mt-2" placeholder="you@example.com" autocomplete="email" @input="detectProvider"/></label>
+              <label class="block text-xs">密码 / 授权码<input v-model="connection.password" type="password" required minlength="1" maxlength="256" class="field mt-2" placeholder="邮箱密码或客户端授权码" autocomplete="off"/></label>
+            </div>
             <label class="block text-xs">邮箱服务商<select v-model="connection.provider" class="field mt-2" @change="applyPreset(connection.provider)"><option value="">自动识别 / 请选择</option><option v-for="preset in config.mailProviders" :key="preset.id" :value="preset.id">{{preset.name}}</option><option value="custom">自定义 / 其他邮箱</option></select></label>
             <p v-if="presetHint" class="text-xs leading-6 text-slate-400">{{presetHint}}</p>
-            <div class="rounded-xl border divider p-4">
-              <p class="mb-3 text-xs font-medium text-slate-500">收信服务器（IMAP）</p>
-              <label class="block text-xs">服务器地址<input v-model="connection.imapHost" required maxlength="253" class="field mt-2" placeholder="imap.example.com"/></label>
-              <div class="mt-3 grid grid-cols-2 gap-3">
-                <label class="block text-xs">端口<input v-model.number="connection.imapPort" type="number" min="1" max="65535" required class="field mt-2"/></label>
-                <label class="block text-xs">加密方式<select v-model="connection.imapSecurity" class="field mt-2"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
+            <div class="grid gap-4 sm:grid-cols-2">
+              <div class="rounded-xl border divider p-4">
+                <p class="mb-3 text-xs font-medium text-slate-500">收信服务器（IMAP）</p>
+                <label class="block text-xs">服务器地址<input v-model="connection.imapHost" required maxlength="253" class="field mt-2" placeholder="imap.example.com"/></label>
+                <div class="mt-3 grid grid-cols-2 gap-3">
+                  <label class="block text-xs">端口<input v-model.number="connection.imapPort" type="number" min="1" max="65535" required class="field mt-2"/></label>
+                  <label class="block text-xs">加密方式<select v-model="connection.imapSecurity" class="field mt-2"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
+                </div>
               </div>
-            </div>
-            <div class="rounded-xl border divider p-4">
-              <p class="mb-3 text-xs font-medium text-slate-500">发信服务器（SMTP）</p>
-              <label class="block text-xs">服务器地址<input v-model="connection.smtpHost" required maxlength="253" class="field mt-2" placeholder="smtp.example.com"/></label>
-              <div class="mt-3 grid grid-cols-2 gap-3">
-                <label class="block text-xs">端口<input v-model.number="connection.smtpPort" type="number" min="1" max="65535" required class="field mt-2"/></label>
-                <label class="block text-xs">加密方式<select v-model="connection.smtpSecurity" class="field mt-2"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
+              <div class="rounded-xl border divider p-4">
+                <p class="mb-3 text-xs font-medium text-slate-500">发信服务器（SMTP）</p>
+                <label class="block text-xs">服务器地址<input v-model="connection.smtpHost" required maxlength="253" class="field mt-2" placeholder="smtp.example.com"/></label>
+                <div class="mt-3 grid grid-cols-2 gap-3">
+                  <label class="block text-xs">端口<input v-model.number="connection.smtpPort" type="number" min="1" max="65535" required class="field mt-2"/></label>
+                  <label class="block text-xs">加密方式<select v-model="connection.smtpSecurity" class="field mt-2"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
+                </div>
               </div>
             </div>
             <p class="text-xs leading-6 text-slate-400">连接时会同时验证收信与发信两个通道，任一失败都不会保存。多数邮箱需要先开启 IMAP/SMTP 服务并使用授权码或专用密码。</p>
             <button class="primary w-full" :disabled="connectionBusy"><Icon v-if="connectionBusy" name="refresh" class="animate-spin" :size="16"/>{{connectionBusy?'正在验证两个通道…':'验证并连接'}}</button>
           </form>
-        </div>
+        </template>
       </template>
-      <template v-else-if="modal==='settings'"><div class="mb-6 flex items-center gap-3 rounded-xl bg-slate-50 p-4 dark:bg-slate-800"><span class="flex h-10 w-10 items-center justify-center rounded-full bg-blue-100 text-blue-700">{{initials(user.email)}}</span><div><p class="text-sm font-semibold break-all">{{user.email}}</p><p class="caption mt-1">Hmail 平台账户</p></div><button class="secondary ml-auto !px-3 !text-xs" @click="logout"><Icon name="logout" :size="14"/>退出</button></div><h3 class="mb-3 text-sm font-medium">已连接邮箱</h3><div v-for="account in accounts" :key="account.id" class="mb-3 flex items-center gap-3 rounded-xl border divider p-3"><div class="min-w-0 flex-1"><p class="truncate text-sm">{{account.email}}</p><p class="caption mt-1">{{account.provider==='oauth'?'Google OAuth':'IMAP＋SMTP'}}</p></div><button class="text-xs text-slate-400 hover:text-red-500" @click="disconnect(account)">断开</button></div><button class="mb-6 text-sm text-blue-600" @click="openConnect">＋ 连接另一个邮箱</button><details class="border-t divider pt-4"><summary class="cursor-pointer text-sm">修改密码</summary><form class="mt-4 space-y-3" @submit.prevent="changePassword"><input v-model="changingPassword.currentPassword" type="password" required class="field" placeholder="当前密码" autocomplete="current-password"/><input v-model="changingPassword.password" type="password" required minlength="10" class="field" placeholder="新密码（至少 10 个字符）" autocomplete="new-password"/><p class="text-xs leading-6 text-slate-400">修改密码会撤销所有已登录会话，需要重新登录。</p><button class="primary" type="submit">保存并重新登录</button></form></details></template>
+      <template v-else-if="modal==='settings'"><div class="mb-6 flex items-center gap-3 rounded-xl bg-slate-50 p-4 dark:bg-slate-800"><span class="flex h-10 w-10 items-center justify-center rounded-full bg-blue-100 text-blue-700">{{initials(user.email)}}</span><div><p class="text-sm font-semibold break-all">{{user.email}}</p><p class="caption mt-1">Hmail 平台账户</p></div><button class="secondary ml-auto !px-3 !text-xs" @click="logout"><Icon name="logout" :size="14"/>退出</button></div><h3 class="mb-3 text-sm font-medium">已连接邮箱</h3><div v-for="account in accounts" :key="account.id" class="mb-3 flex items-center gap-3 rounded-xl border divider p-3"><div class="min-w-0 flex-1"><p class="truncate text-sm">{{account.email}}</p><p class="caption mt-1 flex flex-wrap items-center gap-2"><span>{{account.provider==='oauth'?'Google OAuth':'IMAP＋SMTP'}}</span><span v-if="account.isDefault" class="rounded-full bg-blue-50 px-2 py-0.5 text-[11px] text-blue-600 dark:bg-blue-900/40 dark:text-blue-300">默认邮箱</span></p></div><button class="shrink-0 text-xs" :class="account.isDefault?'text-slate-400 hover:text-slate-600 dark:hover:text-slate-200':'text-blue-600 dark:text-blue-300'" @click="setDefaultAccount(account)">{{account.isDefault?'取消默认':'设为默认'}}</button><button class="shrink-0 text-xs text-slate-400 hover:text-red-500" @click="disconnect(account)">断开</button></div><button class="mb-6 text-sm text-blue-600" @click="openConnect">＋ 连接另一个邮箱</button><details class="border-t divider pt-4"><summary class="cursor-pointer text-sm">修改密码</summary><form class="mt-4 space-y-3" @submit.prevent="changePassword"><input v-model="changingPassword.currentPassword" type="password" required class="field" placeholder="当前密码" autocomplete="current-password"/><input v-model="changingPassword.password" type="password" required minlength="10" class="field" placeholder="新密码（至少 10 个字符）" autocomplete="new-password"/><p class="text-xs leading-6 text-slate-400">修改密码会撤销所有已登录会话，需要重新登录。</p><button class="primary" type="submit">保存并重新登录</button></form></details></template>
       <form v-else-if="modal==='label'" @submit.prevent="saveLabel"><label class="block text-sm">标签名称<input v-model="labelName" class="field mt-2" required maxlength="200" autofocus/></label><div class="mt-6 flex justify-between"><button v-if="labelEdit" type="button" class="text-sm text-red-500" @click="deleteLabel(labelEdit);modal=''">删除标签</button><button class="primary ml-auto">保存</button></div></form>
       <form v-else @submit.prevent="modify([labelChoice]);modal='' "><select v-model="labelChoice" class="field" required><option value="" disabled>选择标签</option><option v-for="label in customLabels" :key="label.id" :value="label.id">{{label.name}}</option></select><p v-if="!customLabels.length" class="mt-3 text-xs text-slate-400">请先在侧边栏创建标签。</p><div class="mt-5 flex justify-end gap-2"><button type="button" class="secondary" :disabled="!labelChoice" @click="modify([],[labelChoice]);modal=''">移除标签</button><button class="primary" :disabled="!labelChoice">应用</button></div></form>
     </section>
