@@ -57,14 +57,16 @@ fun ComposeScreen(
     val state = model.compose
     // 顶部栏标题跟随入口：从「继续写信」进来时与按钮上的文字保持一致。
     val title = if (draft) "继续写信" else "写邮件"
-    // 整页容器（背景与全部组件）与主页入口按钮的背景共享；标题与按钮文字共享。
+    // 整页容器（背景与全部组件）与主页入口按钮的背景共享；图标与顶部栏返回键、标题与按钮文字分别共享。
     val pageModifier = sharedTransitionScope.sharedPageElement(ComposeSharedKeys.page(draft), animatedVisibilityScope)
+    val iconModifier = sharedTransitionScope.sharedTextElement(ComposeSharedKeys.icon(draft), animatedVisibilityScope)
     val titleModifier = sharedTransitionScope.sharedTextElement(ComposeSharedKeys.title(draft), animatedVisibilityScope)
     if (state == null) {
         MailPage(
             title = title,
             onBack = onBack,
             pageModifier = pageModifier,
+            navigationIconModifier = iconModifier,
             titleTextModifier = titleModifier
         ) { SectionText("暂无未完成的邮件", muted = true) }
         return
@@ -100,6 +102,7 @@ fun ComposeScreen(
         onBack = onBack,
         progress = model.busy,
         pageModifier = pageModifier,
+        navigationIconModifier = iconModifier,
         titleTextModifier = titleModifier,
         actions = listOf(
             GlassAction("丢弃草稿", "trash", enabled = enabled && !model.busy) { pendingDiscard = true }

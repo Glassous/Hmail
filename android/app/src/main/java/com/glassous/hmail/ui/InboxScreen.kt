@@ -12,7 +12,6 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -56,7 +55,6 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
@@ -198,25 +196,13 @@ fun InboxScreen(
     val top = topInset()
     val bottom = bottomInset()
 
-    // 写邮件入口与写邮件页的共享元素：整页容器（背景 + 全部组件）与标题各配一对，按入口分键。
+    // 写邮件入口与写邮件页的共享元素：整页容器（背景 + 全部组件）、图标与标题各配一对，按入口分键。
     val newPage = sharedTransitionScope.sharedPageElement(ComposeSharedKeys.page(draft = false), animatedVisibilityScope)
     val draftPage = sharedTransitionScope.sharedPageElement(ComposeSharedKeys.page(draft = true), animatedVisibilityScope)
+    val newIcon = sharedTransitionScope.sharedTextElement(ComposeSharedKeys.icon(draft = false), animatedVisibilityScope)
+    val draftIcon = sharedTransitionScope.sharedTextElement(ComposeSharedKeys.icon(draft = true), animatedVisibilityScope)
     val newTitle = sharedTransitionScope.sharedTextElement(ComposeSharedKeys.title(draft = false), animatedVisibilityScope)
     val draftTitle = sharedTransitionScope.sharedTextElement(ComposeSharedKeys.title(draft = true), animatedVisibilityScope)
-    // 点按后按钮图标立即消失；共享过渡（含返回）期间继续隐藏，落位后淡入。
-    var newIconHidden by remember { mutableStateOf(false) }
-    var draftIconHidden by remember { mutableStateOf(false) }
-    val transitionActive = sharedTransitionScope.isTransitionActive
-    val newIconAlpha = animateFloatAsState(
-        targetValue = if (newIconHidden || transitionActive) 0f else 1f,
-        animationSpec = tween(120),
-        label = "composeIconAlpha"
-    )
-    val draftIconAlpha = animateFloatAsState(
-        targetValue = if (draftIconHidden || transitionActive) 0f else 1f,
-        animationSpec = tween(120),
-        label = "continueDraftIconAlpha"
-    )
 
     // 返回详情页时保留位置；冷启动由本地列表直接提供首屏。
     LaunchedEffect(listState) {
@@ -467,14 +453,12 @@ fun InboxScreen(
                     backdrop = backdrop,
                     modifier = Modifier.height(FabHeight).then(draftPage),
                     tint = HmailTheme.card,
-                    onClick = {
-                        draftIconHidden = true
-                        onContinueDraft()
-                    }
+                    onClick = onContinueDraft
                 ) {
                     MailIcon(
                         "draft_file",
-                        modifier = Modifier.graphicsLayer { alpha = draftIconAlpha.value },
+                        // 与写邮件页顶部栏的返回键共享：随过渡一起飞行。
+                        modifier = draftIcon,
                         tint = MaterialTheme.colorScheme.onBackground
                     )
                     Spacer(Modifier.width(8.dp))
@@ -494,7 +478,6 @@ fun InboxScreen(
                 onClick = {
                     if (model.active.isBlank()) onConnect()
                     else {
-                        newIconHidden = true
                         model.startCompose()
                         onCompose()
                     }
@@ -502,7 +485,8 @@ fun InboxScreen(
             ) {
                 MailIcon(
                     "edit",
-                    modifier = Modifier.graphicsLayer { alpha = newIconAlpha.value },
+                    // 与写邮件页顶部栏的返回键共享：随过渡一起飞行。
+                    modifier = newIcon,
                     tint = MaterialTheme.colorScheme.onBackground
                 )
                 AnimatedVisibility(

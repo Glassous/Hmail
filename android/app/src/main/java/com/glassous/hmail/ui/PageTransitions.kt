@@ -49,6 +49,9 @@ object ComposeSharedKeys {
     /** 整页容器：按钮玻璃胶囊 ↔ 写邮件页的背景与全部组件。 */
     fun page(draft: Boolean) = "hmail:compose:page:${if (draft) "draft" else "new"}"
 
+    /** 图标：按钮图标 ↔ 写邮件页顶部栏的返回键。 */
+    fun icon(draft: Boolean) = "hmail:compose:icon:${if (draft) "draft" else "new"}"
+
     /** 标题：按钮文字 ↔ 写邮件页顶部栏标题。 */
     fun title(draft: Boolean) = "hmail:compose:title:${if (draft) "draft" else "new"}"
 }

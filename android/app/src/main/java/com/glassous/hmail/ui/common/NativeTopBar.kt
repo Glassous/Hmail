@@ -33,6 +33,8 @@ fun NativeTopBar(
     navigationDescription: String = "返回",
     onNavigationClick: (() -> Unit)? = null,
     actions: List<GlassAction> = emptyList(),
+    /** 返回键图标的修饰符（共享元素过渡用）。 */
+    navigationIconModifier: Modifier = Modifier,
     /** 标题文字的修饰符（共享元素过渡用）。 */
     titleTextModifier: Modifier = Modifier
 ) {
@@ -48,7 +50,11 @@ fun NativeTopBar(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (onNavigationClick != null) {
                         IconButton(onClick = onNavigationClick) {
-                            MailIcon(navigationIcon, contentDescription = navigationDescription)
+                            MailIcon(
+                                navigationIcon,
+                                contentDescription = navigationDescription,
+                                modifier = navigationIconModifier
+                            )
                         }
                     }
                     Text(
