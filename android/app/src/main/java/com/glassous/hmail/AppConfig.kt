@@ -8,13 +8,13 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 
 /** 只放行 http/https/mailto，避免从邮件内容里打开任意 scheme。 */
-fun openExternal(context: Context, url: String, onError: (String) -> Unit = {}) {
+fun openExternal(context: Context, url: String) {
     val uri = Uri.parse(url)
     if (uri.scheme !in listOf("https", "http", "mailto")) return
     try {
         context.startActivity(Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE))
     } catch (_: Exception) {
-        onError("没有可打开此链接的应用")
+        // 没有可打开链接的应用时静默失败，与用户取消打开等效。
     }
 }
 

@@ -68,7 +68,6 @@ fun AuthScreen(model: MailModel, mode: String, onNavigate: (String) -> Unit) {
             model.work {
                 val result = model.api.json("/auth/send-code", "POST", obj("email" to address, "purpose" to mode))
                 model.cooldowns[group] = System.currentTimeMillis() + result.optLong("cooldown", 60) * 1000
-                model.notice("验证码已发送")
             }
         }
     }
@@ -90,7 +89,6 @@ fun AuthScreen(model: MailModel, mode: String, onNavigate: (String) -> Unit) {
                 password = ""
                 code = ""
                 if (mode == "reset") {
-                    model.notice("密码已重设")
                     onNavigate(Routes.Login)
                 } else {
                     model.setSession(result)

@@ -195,7 +195,7 @@ fun ComposeScreen(
         SecondaryAction(
             title = "保存草稿",
             enabled = enabled && !model.busy,
-            onClick = { model.work { model.saveDraft(); model.notice("草稿已保存") } }
+            onClick = { model.work { model.saveDraft() } }
         )
         Spacer(Modifier.height(8.dp))
         PrimaryAction(
@@ -239,7 +239,6 @@ private fun addAttachments(
         try {
             for (uri in uris) {
                 if (state.attachments.size >= 30) {
-                    model.notice("最多添加 30 个附件")
                     break
                 }
                 val remaining = model.config.optLong("maxAttachmentBytes", 18L * 1024 * 1024) -

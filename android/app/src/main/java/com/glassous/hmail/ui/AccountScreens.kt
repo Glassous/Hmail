@@ -80,7 +80,6 @@ fun AccountsScreen(model: MailModel, onBack: () -> Unit, onConnect: () -> Unit) 
                 model.work {
                     model.api.json("/gmail-accounts/${enc(account.id)}", "DELETE")
                     model.refreshAccounts()
-                    model.notice("已断开连接")
                 }
             }
         )
@@ -118,7 +117,6 @@ fun PasswordScreen(model: MailModel, onBack: () -> Unit) {
                 current = ""
                 password = ""
                 model.clearSession()
-                model.notice("密码已修改")
             }
         }
     }
@@ -167,7 +165,7 @@ fun ConnectScreen(model: MailModel, onBack: () -> Unit) {
                 model.work {
                     val result = model.api.json("/gmail-accounts/oauth/mobile/start", "POST")
                     model.vault.write("oauth", result.str("ticket"))
-                    openExternal(context, result.str("url")) { model.notice(it) }
+                    openExternal(context, result.str("url"))
                 }
             }
             Spacer(Modifier.height(16.dp))
@@ -274,7 +272,6 @@ fun ConnectScreen(model: MailModel, onBack: () -> Unit) {
                     model.forms.remove("ConnectFragment")
                     model.refreshAccounts()
                     model.switchAccount(result.str("id"))
-                    model.notice("邮箱已连接")
                     onBack()
                 }
             }

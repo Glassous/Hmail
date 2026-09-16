@@ -9,7 +9,6 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
@@ -43,8 +42,6 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
     /** 本地是否存在未过期的会话 Cookie；只用于决定首屏，不发起网络请求。 */
     val loggedIn get() = user != null || api.hasSession
     val revision = MutableStateFlow(0)
-    private val notices = Channel<String>(Channel.BUFFERED)
-    val events = notices.receiveAsFlow()
     private var localRestored = false
     private val sessionMutex = Mutex()
     private var sessionReady = false
@@ -111,22 +108,11 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
     private var listGeneration = 0
     private var authGeneration = 0
     fun changed() { revision.value++ }
-    fun notice(value: String) { notices.trySend(value) }
     fun path(suffix: String, aid: String = active) = "/gmail-accounts/${enc(aid)}$suffix"
     fun form(name: String) = forms.getOrPut(name) { mutableMapOf() }
     fun fail(error: Throwable) {
         if (error is CancellationException) return
         if (error is ApiFailure && error.code in listOf("unauthorized", "csrf")) clearSession()
-        val message = when {
-            error is ApiFailure && error.code == "csrf" -> "请重新登录后重试"
-            error is ApiFailure && error.code == "origin" -> "暂时无法连接，请稍后重试"
-            error is ApiFailure && error.code in listOf("not_configured", "internal", "unavailable") -> "服务暂时不可用，请稍后重试"
-            error is ApiFailure && error.code.startsWith("oauth_") -> "连接未完成，请重试"
-            error is ApiFailure -> error.message ?: "操作失败，请重试"
-            error is java.io.IOException -> "网络连接失败，请重试"
-            else -> "操作失败，请重试"
-        }
-        notice(message)
     }
     /** Runs before setContent, on IO: the first frame already contains the local mailbox. */
     suspend fun restoreLocalMailbox() {
@@ -488,7 +474,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
             if (leavesFolder) null else Mail(JSONObject(mail.raw.toString()).put("labels", JSONArray(updatedLabels)))
         }
         selected.clear(); cacheCurrentList(); changed()
-        loadList(); notice("邮件已更新")
+        loadList()
     }
     fun persistCompose() {
         val state = compose ?: return
@@ -496,7 +482,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         vault.write("draft:${state.owner}", state.stored())
     }
     fun startCompose(mode: String = "", mail: Mail? = null) {
-        if (compose != null) { notice("已恢复未完成的邮件"); return }
+        if (compose != null) return
         val owner = user?.str("id") ?: return
         if (active.isBlank()) return
         val state = ComposeState(owner, active)
@@ -517,7 +503,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         compose = state; savedText = ""; persistCompose(); if (state.dirty) dirty(); changed()
     }
     suspend fun openDraft(mail: Mail) = coroutineScope<Unit> {
-        if (compose != null) { notice("已恢复未完成的邮件"); return@coroutineScope }
+        if (compose != null) return@coroutineScope
         threadJob?.cancel()
         threadJob = currentCoroutineContext()[Job]
         val generation = ++threadGeneration
@@ -591,9 +577,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         // Persist before dispatch: process death must not allow an accidental resend.
         state.uncertain = true; persistCompose(); changed()
         try {
-            val result = api.json(path("/send", state.account), "POST", state.payload)
-            val refused = result.optJSONObject("result")?.optJSONArray("refused")
-            notice(result.str("warning").ifBlank { if (refused != null && refused.length() > 0) "邮件已发送，部分收件人未能接收" else "邮件已发送" })
+            api.json(path("/send", state.account), "POST", state.payload)
             vault.write("draft:${state.owner}", null); compose = null
             if (folder == "DRAFT") loadList() // 仅草稿箱需要立即移除已发送的草稿。
         } catch (e: Exception) {
@@ -613,9 +597,8 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         val result = api.call("/gmail-accounts/oauth/mobile/status", ticket = ticket) as JSONObject
         when (result.str("status")) {
             "waiting" -> return true
-            "success" -> { vault.write("oauth", null); refreshAccounts(); loadList(); notice("邮箱已连接") }
-            "cancelled" -> { vault.write("oauth", null); notice("已取消连接") }
-            else -> { vault.write("oauth", null); notice("连接未完成，请重试") }
+            "success" -> { vault.write("oauth", null); refreshAccounts(); loadList() }
+            else -> vault.write("oauth", null)
         }
         return false
     }

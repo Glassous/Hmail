@@ -5,19 +5,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.navigationBars
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -26,10 +19,8 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -69,14 +60,9 @@ fun HmailApp(model: MailModel, activity: ComponentActivity) {
         val startRoute = remember { if (model.loggedIn) Routes.Inbox else Routes.Login }
         val navController = rememberNavController()
         val drawerState = rememberDrawerState(DrawerValue.Closed)
-        val snackbar = remember { SnackbarHostState() }
         val scope = rememberCoroutineScope()
         val entry by navController.currentBackStackEntryAsState()
         val route = entry?.destination?.route ?: startRoute
-
-        LaunchedEffect(model) {
-            model.events.collect { snackbar.showSnackbar(it, actionLabel = "关闭") }
-        }
 
         // 会话恢复/失效时纠正落地页；恢复期间不做判定，避免误跳登录页。
         LaunchedEffect(revision, route) {
@@ -252,15 +238,6 @@ fun HmailApp(model: MailModel, activity: ComponentActivity) {
                             onCreateLabel = { navController.navigate(Routes.labelEdit("")) }
                         )
                     }
-                }
-                // 共享层本身不是 BoxScope，居中对齐交给一层全屏 Box。
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
-                    SnackbarHost(
-                        hostState = snackbar,
-                        modifier = Modifier
-                            .windowInsetsPadding(WindowInsets.navigationBars)
-                            .padding(16.dp)
-                    )
                 }
             }
         }

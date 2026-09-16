@@ -94,7 +94,6 @@ fun ThreadScreen(
                 withContext(Dispatchers.IO) {
                     resolver.openOutputStream(uri)?.use { it.write(bytes) } ?: throw java.io.IOException()
                 }
-                model.notice("附件已保存")
             }
         }
         downloadPath = null
@@ -328,7 +327,7 @@ private fun HtmlMessage(html: String, aid: String, context: Context, model: Mail
                 CookieManager.getInstance().setAcceptCookie(false)
                 webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                        openExternal(context, request.url.toString()) { model.notice(it) }
+                        openExternal(context, request.url.toString())
                         return true
                     }
 
