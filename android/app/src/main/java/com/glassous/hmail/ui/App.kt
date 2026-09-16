@@ -64,7 +64,7 @@ fun HmailApp(model: MailModel, activity: ComponentActivity) {
     }
     HmailTheme(darkTheme = dark) {
         SystemBars(dark)
-        // 首帧由本地会话决定：有会话直接进主页，进入后再加载数据。
+        // 首帧已从磁盘恢复邮箱与邮件；无网络时仍直接显示本地列表。
         val startRoute = remember { if (model.loggedIn) Routes.Inbox else Routes.Login }
         val navController = rememberNavController()
         val drawerState = rememberDrawerState(DrawerValue.Closed)

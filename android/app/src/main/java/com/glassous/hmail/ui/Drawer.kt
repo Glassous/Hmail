@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.glassous.hmail.MailIcon
 import com.glassous.hmail.MailModel
+import com.glassous.hmail.MailboxState
 import com.glassous.hmail.folders
 import com.glassous.hmail.ui.common.SecondaryAction
 import com.glassous.hmail.ui.theme.Brand
@@ -66,7 +67,7 @@ fun DrawerContent(
             fontSize = 27.sp,
             fontWeight = FontWeight.Bold
         )
-        AccountSelector(model)
+        AccountSelector(model.mailbox, { model.switchAccount(it) }, model::retryAccounts)
         Spacer(Modifier.height(12.dp))
         Box(Modifier.padding(horizontal = 20.dp)) {
             SecondaryAction("连接邮箱") {
@@ -81,6 +82,12 @@ fun DrawerContent(
                     onClose()
                     model.chooseFolder(key)
                 }
+            }
+            if (model.mailbox.labelsLoading) {
+                Text("正在加载标签", Modifier.padding(horizontal = 24.dp, vertical = 8.dp), color = HmailTheme.colors.muted)
+            }
+            model.mailbox.labelsError?.let { error ->
+                Text(error, Modifier.clickable { model.refreshLabels() }.padding(24.dp), color = MaterialTheme.colorScheme.error)
             }
             val userLabels = model.labels.filter { it.type == "user" }
             if (userLabels.isNotEmpty()) {
@@ -107,39 +114,48 @@ fun DrawerContent(
 }
 
 @Composable
-private fun AccountSelector(model: MailModel) {
+private fun AccountSelector(state: MailboxState, onSelect: (String) -> Unit, onRetry: () -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-    val current = model.accounts.firstOrNull { it.id == model.active }
-    Box(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(60.dp)
-                .clip(RoundedCornerShape(16.dp))
-                .background(HmailTheme.colors.field)
-                .clickable(enabled = model.accounts.isNotEmpty()) { expanded = true }
-                .padding(horizontal = 16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = current?.email ?: "尚未连接邮箱",
-                modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onBackground,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            MailIcon("chevron_down", contentDescription = "切换邮箱", tint = HmailTheme.colors.muted)
+    val current = state.accounts.firstOrNull { it.id == state.active }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+        if (state.accountsError != null) {
+            Text(state.accountsError, Modifier.clickable(onClick = onRetry).padding(vertical = 8.dp), color = MaterialTheme.colorScheme.error)
         }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            model.accounts.forEach { account ->
-                DropdownMenuItem(
-                    text = { Text(account.email, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    onClick = {
-                        expanded = false
-                        if (account.id != model.active) model.switchAccount(account.id)
-                    }
+        Box {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(60.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(HmailTheme.colors.field)
+                    .clickable(enabled = state.accounts.isNotEmpty()) { expanded = true }
+                    .padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = current?.email ?: when {
+                        state.accountsLoading -> "正在加载邮箱"
+                        state.accountsError != null -> "邮箱加载失败"
+                        else -> "尚未连接邮箱"
+                    },
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
+                MailIcon("chevron_down", contentDescription = "切换邮箱", tint = HmailTheme.colors.muted)
+            }
+            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                state.accounts.forEach { account ->
+                    DropdownMenuItem(
+                        text = { Text(account.email, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        onClick = {
+                            expanded = false
+                            if (account.id != state.active) onSelect(account.id)
+                        }
+                    )
+                }
             }
         }
     }

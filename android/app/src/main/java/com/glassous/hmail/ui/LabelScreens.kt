@@ -32,7 +32,9 @@ fun LabelsScreen(model: MailModel, onBack: () -> Unit, onEdit: (String) -> Unit)
     revisionOf(model)
     val labels = model.labels.filter { it.type == "user" }
     MailPage(title = "管理标签", onBack = onBack, progress = model.busy) {
-        if (labels.isEmpty()) SectionText("还没有标签", muted = true)
+        if (model.mailbox.labelsLoading) SectionText("正在加载标签", muted = true)
+        model.mailbox.labelsError?.let { SecondaryAction(it) { model.refreshLabels() } }
+        if (labels.isEmpty() && !model.mailbox.labelsLoading && model.mailbox.labelsError == null) SectionText("还没有标签", muted = true)
         labels.forEach { label ->
             SecondaryAction(label.name) { onEdit(label.id) }
             Spacer(Modifier.height(8.dp))
@@ -68,11 +70,12 @@ fun LabelEditScreen(model: MailModel, labelId: String, onBack: () -> Unit) {
                     error = "请输入标签名称"
                     return@work
                 }
+                val aid = model.active
                 model.api.json(
-                    model.path("/labels"), "POST",
+                    model.path("/labels", aid), "POST",
                     obj("action" to if (labelId.isBlank()) "create" else "rename", "id" to labelId, "name" to trimmed)
                 )
-                model.labels = model.api.list(model.path("/labels")).map(MailLabel::from)
+                model.refreshLabels(aid)
                 model.forms.remove(group)
                 onBack()
             }
@@ -90,9 +93,10 @@ fun LabelEditScreen(model: MailModel, labelId: String, onBack: () -> Unit) {
             onConfirm = {
                 pendingDelete = false
                 model.work {
-                    model.api.json(model.path("/labels"), "POST", obj("action" to "delete", "id" to labelId))
-                    model.labels = model.api.list(model.path("/labels")).map(MailLabel::from)
-                    if (model.folder == labelId) model.chooseFolder("INBOX")
+                    val aid = model.active
+                    model.api.json(model.path("/labels", aid), "POST", obj("action" to "delete", "id" to labelId))
+                    model.refreshLabels(aid)
+                    if (model.active == aid && model.folder == labelId) model.chooseFolder("INBOX")
                     onBack()
                 }
             }
@@ -112,6 +116,8 @@ fun LabelPickScreen(
     var choice by remember { mutableStateOf(labels.firstOrNull()?.id.orEmpty()) }
 
     MailPage(title = "选择标签", onBack = onBack, progress = model.busy) {
+        if (model.mailbox.labelsLoading) SectionText("正在加载标签", muted = true)
+        model.mailbox.labelsError?.let { SecondaryAction(it) { model.refreshLabels() } }
         if (labels.isEmpty()) {
             PrimaryAction("新建标签") { onCreateLabel() }
             return@MailPage

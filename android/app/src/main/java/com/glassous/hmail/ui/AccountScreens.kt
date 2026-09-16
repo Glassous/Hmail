@@ -52,7 +52,10 @@ fun AccountsScreen(model: MailModel, onBack: () -> Unit, onConnect: () -> Unit) 
     revisionOf(model)
     var pending by remember { mutableStateOf<String?>(null) }
     MailPage(title = "邮箱管理", onBack = onBack, progress = model.busy) {
-        if (model.accounts.isEmpty()) SectionText("尚未连接邮箱", muted = true)
+        if (model.mailbox.accountsLoading) SectionText("正在加载邮箱", muted = true)
+        model.mailbox.accountsError?.let { SecondaryAction(it) { model.retryAccounts() } }
+        if (model.accounts.isEmpty() && !model.mailbox.accountsLoading && model.mailbox.accountsError == null)
+            SectionText("尚未连接邮箱", muted = true)
         model.accounts.forEach { account ->
             SectionTitle(account.email)
             if (account.status == "reconnect") SectionText("需要重新连接", muted = true)

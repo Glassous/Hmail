@@ -99,7 +99,7 @@ fun AuthScreen(model: MailModel, mode: String, onNavigate: (String) -> Unit) {
         }
     }
 
-    // 登录页没有顶部栏（顶栏标题即提交按钮文案），注册/重设沿用统一的悬浮玻璃顶栏。
+    // 登录页没有顶部栏（顶栏标题即提交按钮文案），注册/重设使用固定紧凑的 MD3 顶栏。
     MailPage(
         title = if (mode == "login") null else title,
         onBack = if (mode == "login") null else ({ onNavigate(Routes.Login) }),

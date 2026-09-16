@@ -49,6 +49,7 @@ object IconPaths {
         "eye_off" -> "M3,3 L21,21 M2,12 C5.5,7.2 9,5 12,5 C13.4,5 14.8,5.4 16.2,6.1 M22,12 C18.5,16.8 15,19 12,19 C10.6,19 9.2,18.6 7.8,17.9"
         "settings" -> "M9,3 L15,3 L16,6 L19,7 L22,12 L19,17 L16,18 L15,21 L9,21 L8,18 L5,17 L2,12 L5,7 L8,6 Z M16,12 A4,4 0,1 1,8,12 A4,4 0,1 1,16,12"
         "archive" -> "M3,7 L21,7 L21,11 L3,11 Z M5,11 L5,21 L19,21 L19,11 M10,15 L14,15"
+        "restore" -> "M12,20 L12,9 M7.5,13.5 L12,9 L16.5,13.5"
         "read" -> "M3,6 L21,6 L21,18 L3,18 Z M3,7 L12,14 L21,7"
         "unread" -> "M3,6 L21,6 L21,18 L3,18 Z M3,7 L12,14 L21,7 M19,5 L19,5.1"
         "select_all" -> "M4,5 L20,5 M4,12 L20,12 M4,19 L20,19 M2,5 L2,5.1 M2,12 L2,12.1 M2,19 L2,19.1"
@@ -67,7 +68,7 @@ class IconDrawable(
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = tint
         style = Paint.Style.STROKE
-        strokeWidth = 1.8f
+        strokeWidth = if (type == "more") 3.4f else 1.8f
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }

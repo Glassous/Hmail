@@ -23,6 +23,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -38,6 +39,7 @@ import com.glassous.hmail.sizeText
 import com.glassous.hmail.str
 import com.glassous.hmail.ui.common.ConfirmDialog
 import com.glassous.hmail.ui.common.GlassAction
+import com.glassous.hmail.ui.common.SelectionActionCard
 import com.glassous.hmail.ui.common.MailPage
 import com.glassous.hmail.ui.common.SecondaryAction
 import com.glassous.hmail.ui.common.SectionText
@@ -62,6 +64,7 @@ fun ThreadScreen(
     var reload by remember { mutableStateOf(0) }
     var downloadPath by remember { mutableStateOf<String?>(null) }
     var pendingTrash by remember { mutableStateOf(false) }
+    var cardOpen by remember { mutableStateOf(false) }
     val inTrash = model.folder == "TRASH"
 
     LaunchedEffect(threadId, aid, reload) {
@@ -86,33 +89,48 @@ fun ThreadScreen(
     // 与重构前一致：只有当前载入的会话与路由参数匹配时才渲染，避免串会话。
     val messages = if (model.messages.firstOrNull()?.threadId == threadId) model.messages else emptyList()
 
+    // 顶栏只留刷新与三点；其余操作收进与主页共用的实色卡片。
+    val cardActions = listOf(
+        GlassAction("归档", "archive") {
+            model.work {
+                model.modify(remove = listOf("INBOX"), threads = listOf(threadId))
+                onBack()
+            }
+        },
+        GlassAction("标为未读", "unread") {
+            model.work {
+                model.modify(add = listOf("UNREAD"), threads = listOf(threadId))
+                onBack()
+            }
+        },
+        GlassAction("标记垃圾邮件", "SPAM") {
+            model.work {
+                model.modify(add = listOf("SPAM"), remove = listOf("INBOX"), threads = listOf(threadId))
+                onBack()
+            }
+        },
+        GlassAction(if (inTrash) "恢复邮件" else "移入回收站", if (inTrash) "restore" else "trash") {
+            pendingTrash = true
+        },
+        GlassAction("标签", "tag") { onLabelPick() }
+    )
+
     MailPage(
         title = "邮件",
         onBack = onBack,
         progress = model.busy,
         actions = listOf(
             GlassAction("刷新", "refresh") { reload++ },
-            GlassAction("归档") {
-                model.work {
-                    model.modify(remove = listOf("INBOX"), threads = listOf(threadId))
-                    onBack()
-                }
-            },
-            GlassAction("标为未读") {
-                model.work {
-                    model.modify(add = listOf("UNREAD"), threads = listOf(threadId))
-                    onBack()
-                }
-            },
-            GlassAction("标记垃圾邮件") {
-                model.work {
-                    model.modify(add = listOf("SPAM"), remove = listOf("INBOX"), threads = listOf(threadId))
-                    onBack()
-                }
-            },
-            GlassAction(if (inTrash) "恢复邮件" else "移入回收站") { pendingTrash = true },
-            GlassAction("标签") { onLabelPick() }
-        )
+            GlassAction("更多操作", "more") { cardOpen = true }
+        ),
+        overlay = { topSpace ->
+            SelectionActionCard(
+                visible = cardOpen,
+                actions = cardActions.map { it.copy(enabled = it.enabled && !model.busy) },
+                topPadding = topSpace + 4.dp,
+                onDismiss = { cardOpen = false }
+            )
+        }
     ) {
         if (messages.isEmpty()) {
             SectionText("正在加载", muted = true)

@@ -3,6 +3,7 @@ package com.glassous.hmail.ui.common
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
@@ -52,8 +53,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.glassous.hmail.MailIcon
-import com.glassous.hmail.ui.glass.glassSource
-import com.glassous.hmail.ui.glass.rememberGlassBackdrop
 import com.glassous.hmail.ui.theme.HmailTheme
 
 /** 状态栏高度（安全区顶部）。 */
@@ -208,17 +207,7 @@ fun ConfirmDialog(title: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {
     )
 }
 
-/**
- * 全应用统一的沉浸式页面骨架（非首页页面同样使用悬浮玻璃顶栏）：
- *
- * - 内容满屏穿透状态栏与导航栏，滚动内容从顶栏下方开始并可在玻璃后面滚动；
- * - 顶栏是「导航按钮 + 标题」合并的单块玻璃，页面在顶部时标题为第二行大字，
- *   向下滚动时平滑折进顶栏；
- * - 右侧操作项每个各自独占一块玻璃；
- * - 软键盘弹出时内容整体上推，底部按钮不被遮挡。
- *
- * [title] 为 null 时不渲染顶栏（例如登录页）。
- */
+/** 非主页使用固定紧凑的 MD3 顶栏；无标题页面维持原有布局。 */
 @Composable
 fun MailPage(
     title: String?,
@@ -232,24 +221,19 @@ fun MailPage(
     navigationDescription: String = "返回",
     actions: List<GlassAction> = emptyList(),
     contentArrangement: Arrangement.Vertical = Arrangement.Top,
+    /** 页面级浮层，参数是顶栏下方的内容起始位置。 */
+    overlay: (@Composable BoxScope.(Dp) -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit
 ) {
     val background = MaterialTheme.colorScheme.background
-    val backdrop = rememberGlassBackdrop(background)
     val scrollState = rememberScrollState()
-    val collapsing = rememberColumnCollapseFraction(scrollState)
-    // 不可滚动页面视为一直处于顶部，保持展开的大字标题。
-    val staticCollapse = remember { mutableStateOf(0f) }
     val top = topInset()
-    val barTop = top + TopBarTopGap
-    val topSpace = if (title == null) top + 8.dp else barTop + TopBarExpandedHeight
-    val isGlassPage = title != null
+    val topSpace = if (title == null) top + 8.dp else top + 64.dp
 
     Box(modifier.fillMaxSize().background(background)) {
-        // 内边距放在 scroll 之内：顶部留白会随内容滚走，页面内容才能在玻璃后面穿过。
+        // 内边距放在 scroll 之内：顶部留白会随内容滚走，页面内容才能在半透明顶栏后面穿过。
         val body = Modifier
             .fillMaxSize()
-            .then(if (isGlassPage) Modifier.glassSource(backdrop) else Modifier)
             .imePadding()
         val insets = Modifier.padding(
             start = horizontalPadding,
@@ -271,15 +255,12 @@ fun MailPage(
             )
         }
         if (title != null) {
-            GlassTopBar(
-                backdrop = backdrop,
+            NativeTopBar(
                 title = title,
-                collapse = if (scroll) collapsing else staticCollapse,
                 navigationIcon = navigationIcon,
                 navigationDescription = navigationDescription,
                 onNavigationClick = onBack,
                 actions = actions,
-                topPadding = barTop,
                 modifier = Modifier.align(Alignment.TopStart)
             )
         }
@@ -291,6 +272,7 @@ fun MailPage(
                     .align(Alignment.TopStart)
             )
         }
+        overlay?.invoke(this, topSpace)
     }
 }
 

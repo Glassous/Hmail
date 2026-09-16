@@ -1,5 +1,13 @@
 package com.glassous.hmail.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.core.MutableTransitionState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -24,6 +32,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -35,10 +44,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.glassous.hmail.Mail
 import com.glassous.hmail.MailIcon
 import com.glassous.hmail.MailModel
 import com.glassous.hmail.folders
@@ -46,24 +57,29 @@ import com.glassous.hmail.shortDate
 import com.glassous.hmail.str
 import com.glassous.hmail.ui.common.GlassAction
 import com.glassous.hmail.ui.common.GlassTopBar
+import com.glassous.hmail.ui.common.SelectionActionCard
+import com.glassous.hmail.ui.common.TopBarCollapsedHeight
 import com.glassous.hmail.ui.common.TopBarExpandedHeight
 import com.glassous.hmail.ui.common.TopBarTopGap
 import com.glassous.hmail.ui.common.bottomInset
 import com.glassous.hmail.ui.common.rememberCollapseFraction
 import com.glassous.hmail.ui.common.topInset
 import com.glassous.hmail.ui.glass.GlassPill
-import com.glassous.hmail.ui.glass.GlassSurface
 import com.glassous.hmail.ui.glass.glassSource
 import com.glassous.hmail.ui.glass.rememberGlassBackdrop
 import com.glassous.hmail.ui.theme.HmailTheme
-import com.kyant.backdrop.backdrops.LayerBackdrop
+import kotlinx.coroutines.delay
 
-private val BoxSize = 56.dp
 private val BlockGap = 12.dp
 private val FabHeight = 56.dp
 
-/** 底部悬浮区总高度：写邮件按钮 + 间距 + 翻页栏。 */
-private val BottomClusterHeight = FabHeight + BlockGap + BoxSize
+/** 底部仅保留写信按钮；加载更多随列表滚动。 */
+private val BottomClusterHeight = FabHeight
+
+private class AnimatedMailEntry(mail: Mail, initiallyVisible: Boolean = false) {
+    var mail by mutableStateOf(mail)
+    val visibility = MutableTransitionState(initiallyVisible).apply { targetState = true }
+}
 
 @Composable
 fun InboxScreen(
@@ -78,14 +94,61 @@ fun InboxScreen(
     val revision = revisionOf(model)
     val mails = remember(revision) { model.items.toList() }
     val selected = remember(revision) { model.selected.toSet() }
+    var cardOpen by remember(model.active, model.folder, model.query, selected.isNotEmpty()) { mutableStateOf(false) }
+    val listState = rememberLazyListState(model.listPosition, model.listOffset)
+    var animatedMails by remember(model.active, model.folder, model.query) {
+        // Initial local content is immediately visible. Only later diffs animate.
+        mutableStateOf(mails.map { AnimatedMailEntry(it, initiallyVisible = true) })
+    }
+    val slideDistance = with(LocalDensity.current) { 28.dp.roundToPx() }
+    LaunchedEffect(mails, model.active, model.folder, model.query) {
+        fun replaceRows(rows: List<AnimatedMailEntry>) {
+            val atTop = listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0
+            val first = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == listState.firstVisibleItemIndex }
+            val anchor = (first?.key as? String)?.removePrefix("mail:")
+            val anchorIndex = rows.indexOfFirst { it.mail.threadId == anchor }
+            val reconnectRows = if (model.accounts.find { it.id == model.active }?.status == "reconnect") 1 else 0
+            // Swap the data once: never expose an empty list with only its footer as the anchor.
+            val hadRows = animatedMails.isNotEmpty()
+            animatedMails = rows
+            if (!listState.isScrollInProgress) {
+                when {
+                    !hadRows || atTop -> listState.requestScrollToItem(0)
+                    anchorIndex >= 0 -> listState.requestScrollToItem(anchorIndex + reconnectRows, listState.firstVisibleItemScrollOffset)
+                    rows.isNotEmpty() -> listState.requestScrollToItem(
+                        listState.firstVisibleItemIndex.coerceAtMost(rows.lastIndex + reconnectRows),
+                        listState.firstVisibleItemScrollOffset
+                    )
+                }
+            }
+        }
+        val previous = animatedMails
+        val byId = previous.associateBy { it.mail.threadId }
+        val currentIds = mails.map { it.threadId }.toSet()
+        val updated = mails.map { mail ->
+            (byId[mail.threadId] ?: AnimatedMailEntry(mail, initiallyVisible = previous.isEmpty())).also {
+                it.mail = mail
+                it.visibility.targetState = true
+            }
+        }.toMutableList()
+        previous.forEachIndexed { index, entry ->
+            if (entry.mail.threadId !in currentIds) {
+                entry.visibility.targetState = false
+                updated.add(index.coerceAtMost(updated.size), entry)
+            }
+        }
+        replaceRows(updated)
+        delay(240)
+        val remaining = animatedMails.filter { it.visibility.targetState }
+        if (remaining.size != animatedMails.size) replaceRows(remaining)
+    }
     val colors = HmailTheme.colors
     val background = MaterialTheme.colorScheme.background
     val backdrop = rememberGlassBackdrop(background)
     val top = topInset()
     val bottom = bottomInset()
 
-    // 列表滚动位置跨页面保留，与重构前 model.listPosition/listOffset 语义一致。
-    val listState = rememberLazyListState(model.listPosition, model.listOffset)
+    // 返回详情页时保留位置；冷启动由本地列表直接提供首屏。
     LaunchedEffect(listState) {
         snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
             .collect { (index, offset) ->
@@ -93,9 +156,9 @@ fun InboxScreen(
                 model.listOffset = offset
             }
     }
-    // 切换文件夹、账号、搜索词或翻页后回到列表顶部；首次进入沿用恢复出的位置。
+    // 切换文件夹、账号或搜索词后回到列表顶部；追加邮件保留当前位置；首次进入沿用恢复出的位置。
     var restored by remember { mutableStateOf(false) }
-    LaunchedEffect(model.active, model.folder, model.query, model.page) {
+    LaunchedEffect(model.active, model.folder, model.query) {
         if (!restored) {
             restored = true
             return@LaunchedEffect
@@ -111,32 +174,32 @@ fun InboxScreen(
         model.query.isNotBlank() -> "搜索结果"
         else -> folders[model.folder] ?: model.labels.find { it.id == model.folder }?.name ?: "邮件"
     }
-    val actions = if (selected.isEmpty()) {
-        listOf(
-            GlassAction("搜索", "search") { onSearch() },
-            GlassAction("刷新", "refresh", enabled = !model.loading) { model.loadList(sync = true) }
-        )
-    } else {
-        listOf(
-            GlassAction("全选") {
-                model.selected.clear()
-                model.selected.addAll(model.items.map { it.threadId })
-                model.changed()
-            },
-            GlassAction("取消选择") {
-                model.selected.clear()
-                model.changed()
-            },
-            GlassAction("归档") { model.work { model.modify(remove = listOf("INBOX")) } },
-            GlassAction("标为已读") { model.work { model.modify(remove = listOf("UNREAD")) } },
-            GlassAction("标为未读") { model.work { model.modify(add = listOf("UNREAD")) } },
-            GlassAction("标记垃圾邮件") { model.work { model.modify(add = listOf("SPAM"), remove = listOf("INBOX")) } },
-            GlassAction(if (model.folder == "TRASH") "恢复邮件" else "移入回收站") {
-                model.work { model.modify(action = if (model.folder == "TRASH") "untrash" else "trash") }
-            },
-            GlassAction("标签") { onLabelPick() }
-        )
-    }
+    val selectionActions = listOf(
+        GlassAction("全选") {
+            model.selected.clear()
+            model.selected.addAll(model.items.map { it.threadId })
+            model.changed()
+        },
+        GlassAction("取消选择") {
+            model.selected.clear()
+            model.changed()
+        },
+        GlassAction("归档") { model.work { model.modify(remove = listOf("INBOX")) } },
+        GlassAction("标为已读") { model.work { model.modify(remove = listOf("UNREAD")) } },
+        GlassAction("标为未读") { model.work { model.modify(add = listOf("UNREAD")) } },
+        GlassAction("标记垃圾邮件") { model.work { model.modify(add = listOf("SPAM"), remove = listOf("INBOX")) } },
+        GlassAction(if (model.folder == "TRASH") "恢复邮件" else "移入回收站") {
+            model.work { model.modify(action = if (model.folder == "TRASH") "untrash" else "trash") }
+        },
+        GlassAction("标签") { onLabelPick() }
+    )
+
+    val topActions = if (selected.isEmpty()) listOf(
+        GlassAction("搜索", "search") { onSearch() },
+        GlassAction("刷新", "refresh", enabled = !model.loading && !model.syncing) { model.loadList(sync = true) }
+    ) else listOf(
+        GlassAction("更多操作", "more") { cardOpen = !cardOpen }
+    )
 
     Box(Modifier.fillMaxSize().background(background)) {
         // 采样源：列表内容在玻璃后方滚动穿透。
@@ -166,51 +229,79 @@ fun InboxScreen(
                     )
                 }
             }
-            items(mails, key = { it.threadId }) { mail ->
-                MailRow(
-                    checked = mail.threadId in selected,
-                    anySelected = selected.isNotEmpty(),
-                    unread = "UNREAD" in mail.labels,
-                    starred = "STARRED" in mail.labels,
-                    sender = mail.from.substringBefore('<').replace("\"", "").trim().ifBlank { mail.from },
-                    count = mail.raw.optInt("count", 1),
-                    subject = mail.subject,
-                    snippet = mail.raw.str("snippet"),
-                    date = shortDate(mail.raw.str("date")),
-                    onToggle = {
-                        if (!model.selected.add(mail.threadId)) model.selected.remove(mail.threadId)
-                        model.changed()
-                    },
-                    onOpen = {
-                        if (!model.busy) {
-                            if (model.folder == "DRAFT") {
-                                model.work {
-                                    model.openDraft(mail)
-                                    onCompose()
+            items(animatedMails, key = { "mail:${it.mail.threadId}" }) { entry ->
+                val mail = entry.mail
+                Box(Modifier.animateItem(
+                    fadeInSpec = null, fadeOutSpec = null,
+                    placementSpec = tween(240, easing = FastOutSlowInEasing)
+                )) {
+                    AnimatedVisibility(
+                        visibleState = entry.visibility,
+                        enter = slideInHorizontally(tween(220, easing = FastOutSlowInEasing)) { slideDistance } + fadeIn(tween(180)),
+                        exit = slideOutHorizontally(tween(180, easing = FastOutSlowInEasing)) { -slideDistance } + fadeOut(tween(180))
+                    ) {
+                        MailRow(
+                            enabled = entry.visibility.targetState,
+                            checked = mail.threadId in selected,
+                            anySelected = selected.isNotEmpty(),
+                            unread = "UNREAD" in mail.labels,
+                            starred = "STARRED" in mail.labels,
+                            sender = mail.from.substringBefore('<').replace("\"", "").trim().ifBlank { mail.from },
+                            count = mail.raw.optInt("count", 1),
+                            subject = mail.subject,
+                            snippet = mail.raw.str("snippet"),
+                            date = shortDate(mail.raw.str("date")),
+                            onToggle = {
+                                if (!model.selected.add(mail.threadId)) model.selected.remove(mail.threadId)
+                                model.changed()
+                            },
+                            onOpen = {
+                                if (!model.busy) {
+                                    if (model.folder == "DRAFT") {
+                                        model.work {
+                                            model.openDraft(mail)
+                                            onCompose()
+                                        }
+                                    } else {
+                                        model.messages = emptyList()
+                                        onOpenThread(model.active, mail.threadId)
+                                    }
                                 }
-                            } else {
-                                model.messages = emptyList()
-                                onOpenThread(model.active, mail.threadId)
+                            },
+                            onStar = {
+                                val starred = "STARRED" in mail.labels
+                                model.work {
+                                    model.modify(
+                                        add = if (starred) emptyList() else listOf("STARRED"),
+                                        remove = if (starred) listOf("STARRED") else emptyList(),
+                                        ids = listOf(mail.id)
+                                    )
+                                }
                             }
-                        }
-                    },
-                    onStar = {
-                        val starred = "STARRED" in mail.labels
-                        model.work {
-                            model.modify(
-                                add = if (starred) emptyList() else listOf("STARRED"),
-                                remove = if (starred) listOf("STARRED") else emptyList(),
-                                ids = listOf(mail.id)
-                            )
-                        }
+                        )
                     }
-                )
+                }
+            }
+            if (animatedMails.any { it.visibility.targetState }) item("load-more") {
+                Box(Modifier.fillMaxWidth().padding(vertical = 16.dp), contentAlignment = Alignment.Center) {
+                    when {
+                        model.loading -> Text(if (model.loadingMore) "正在加载更多…" else "正在更新…", color = colors.muted)
+                        model.localOnly -> TextButton(onClick = { model.loadList(sync = true) }) { Text("显示本地邮件 · 点击联网刷新") }
+                        model.listError != null -> TextButton(onClick = { model.loadList() }) { Text("刷新失败，点击重试") }
+                        model.next.isNotBlank() -> TextButton(enabled = model.canLoadMore, onClick = model::loadMore) {
+                            Text(model.moreError ?: "加载更多")
+                        }
+                        else -> Text("已加载全部邮件", color = colors.muted, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
             }
         }
 
-        if (mails.isEmpty()) {
+        if (mails.isEmpty() && animatedMails.isEmpty()) {
             val empty = when {
                 model.loading || model.starting -> "正在加载"
+                model.mailbox.accountsError != null -> "邮箱加载失败，点击重试"
+                model.listError != null -> model.listError!!
                 model.active.isBlank() -> "连接邮箱"
                 model.query.isNotBlank() -> "没有找到邮件"
                 else -> "暂无邮件"
@@ -220,7 +311,13 @@ fun InboxScreen(
                 modifier = Modifier
                     .align(Alignment.Center)
                     .padding(horizontal = 32.dp)
-                    .clickable(enabled = model.active.isBlank() && !model.starting) { onConnect() },
+                    .clickable(enabled = !model.loading && !model.starting) {
+                        when {
+                            model.mailbox.accountsError != null -> model.retryAccounts()
+                            model.listError != null -> model.loadList()
+                            model.active.isBlank() -> onConnect()
+                        }
+                    },
                 fontSize = 18.sp,
                 color = colors.muted
             )
@@ -230,7 +327,7 @@ fun InboxScreen(
             backdrop = backdrop,
             title = title,
             collapse = collapse,
-            actions = actions,
+            actions = topActions,
             onNavigationClick = onOpenDrawer,
             topPadding = barTop,
             modifier = Modifier.align(Alignment.TopStart)
@@ -272,17 +369,9 @@ fun InboxScreen(
                 Spacer(Modifier.width(8.dp))
                 Text("写邮件", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onBackground)
             }
-            PaginationBar(
-                backdrop = backdrop,
-                page = model.page,
-                canPrevious = !model.loading && model.page > 0,
-                canNext = !model.loading && model.next.isNotBlank(),
-                onPrevious = { model.paginate(-1) },
-                onNext = { model.paginate(1) }
-            )
         }
 
-        if (model.loading || model.busy) {
+        if (model.loading || model.syncing || model.busy) {
             LinearProgressIndicator(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -290,63 +379,12 @@ fun InboxScreen(
                     .align(Alignment.TopStart)
             )
         }
-    }
-}
-
-/** 靠右的三块玻璃：[上一页] [页码] [下一页]，不满宽。 */
-@Composable
-private fun PaginationBar(
-    backdrop: LayerBackdrop,
-    page: Int,
-    canPrevious: Boolean,
-    canNext: Boolean,
-    onPrevious: () -> Unit,
-    onNext: () -> Unit
-) {
-    val onBackground = MaterialTheme.colorScheme.onBackground
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(BlockGap),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        // 禁用态只淡化文字：给玻璃叠加 alpha 图层会让离屏合成失效，玻璃会退化成半透明的色块。
-        GlassPill(
-            backdrop = backdrop,
-            modifier = Modifier.height(BoxSize),
-            enabled = canPrevious,
-            onClick = onPrevious
-        ) {
-            Text(
-                "上一页",
-                maxLines = 1,
-                style = MaterialTheme.typography.labelLarge,
-                color = onBackground.copy(alpha = if (canPrevious) 1f else 0.4f)
-            )
-        }
-        GlassSurface(
-            backdrop = backdrop,
-            modifier = Modifier.size(BoxSize),
-            shape = RoundedCornerShape(percent = 50)
-        ) {
-            Text(
-                text = "${page + 1}",
-                modifier = Modifier.align(Alignment.Center),
-                style = MaterialTheme.typography.titleMedium,
-                color = onBackground
-            )
-        }
-        GlassPill(
-            backdrop = backdrop,
-            modifier = Modifier.height(BoxSize),
-            enabled = canNext,
-            onClick = onNext
-        ) {
-            Text(
-                "下一页",
-                maxLines = 1,
-                style = MaterialTheme.typography.labelLarge,
-                color = onBackground.copy(alpha = if (canNext) 1f else 0.4f)
-            )
-        }
+        SelectionActionCard(
+            visible = cardOpen && selected.isNotEmpty(),
+            actions = selectionActions.map { it.copy(enabled = it.enabled && !model.busy) },
+            topPadding = barTop + TopBarCollapsedHeight + 8.dp,
+            onDismiss = { cardOpen = false }
+        )
     }
 }
 
@@ -354,6 +392,7 @@ private fun PaginationBar(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MailRow(
+    enabled: Boolean,
     checked: Boolean,
     anySelected: Boolean,
     unread: Boolean,
@@ -375,6 +414,7 @@ private fun MailRow(
             // 未选中时行与页面背景完全融为一体，只有选中态才浮起高亮底色。
             .background(if (checked) colors.selected else Color.Transparent)
             .combinedClickable(
+                enabled = enabled,
                 onClick = { if (anySelected) onToggle() else onOpen() },
                 onLongClick = onToggle
             )
@@ -386,7 +426,7 @@ private fun MailRow(
                 .size(44.dp)
                 .clip(RoundedCornerShape(percent = 50))
                 .background(colors.selected)
-                .clickable(onClick = onToggle),
+                .clickable(enabled = enabled, onClick = onToggle),
             contentAlignment = Alignment.Center
         ) {
             Text(
@@ -425,7 +465,7 @@ private fun MailRow(
                 color = colors.muted
             )
         }
-        IconButton(onClick = onStar, modifier = Modifier.size(48.dp)) {
+        IconButton(onClick = onStar, enabled = enabled, modifier = Modifier.size(48.dp)) {
             MailIcon("star", contentDescription = "切换星标", tint = if (starred) colors.star else colors.muted)
         }
     }

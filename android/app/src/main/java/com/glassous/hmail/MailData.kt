@@ -6,8 +6,11 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
@@ -31,8 +34,8 @@ fun JSONObject.str(key: String) = if (isNull(key)) "" else optString(key, "")
 fun JSONObject.array(key: String) = optJSONArray(key) ?: JSONArray()
 
 /** Only ciphertext is written to preferences; the AES key never leaves Keystore. */
-class Vault(context: Context) {
-    private val prefs = context.getSharedPreferences("hmail-vault", Context.MODE_PRIVATE)
+class Vault(context: Context, name: String = "hmail-vault") {
+    private val prefs = context.getSharedPreferences(name, Context.MODE_PRIVATE)
     private val key: SecretKey by lazy {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (store.getKey("hmail-storage", null) as? SecretKey) ?: KeyGenerator.getInstance("AES", "AndroidKeyStore").apply {
@@ -40,7 +43,11 @@ class Vault(context: Context) {
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build())
         }.generateKey()
     }
-    @Synchronized fun read(name: String): String? {
+    // Constructed on Dispatchers.IO; subsequent reads use this in-memory snapshot.
+    private val values = prefs.all.keys.mapNotNull { name -> decrypt(name)?.let { name to it } }.toMap().toMutableMap()
+    @Synchronized fun read(name: String): String? = values[name]
+    @Synchronized fun names(): List<String> = values.keys.toList()
+    private fun decrypt(name: String): String? {
         val raw = prefs.getString(name, null) ?: return null
         return try {
             val bytes = Base64.decode(raw, Base64.NO_WRAP)
@@ -50,7 +57,8 @@ class Vault(context: Context) {
         } catch (_: Exception) { prefs.edit().remove(name).commit(); null }
     }
     @Synchronized fun write(name: String, value: String?) {
-        if (value == null) { prefs.edit().remove(name).commit(); return }
+        if (value == null) { values.remove(name); prefs.edit().remove(name).commit(); return }
+        values[name] = value
         val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key) }
         prefs.edit().putString(name, Base64.encodeToString(cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)).commit()
     }
@@ -59,20 +67,25 @@ class Vault(context: Context) {
 class ApiFailure(val code: String, val status: Int, message: String) : IOException(message)
 class MailApi(private val vault: Vault) {
     @Volatile var csrf = ""
+    @Volatile private var sessionCookie = vault.read("session")?.let { Cookie.parse(SERVER.toHttpUrl(), it) }
+    val hasSession get() = sessionCookie?.expiresAt?.let { it > System.currentTimeMillis() } == true
     private val cookies = object : CookieJar {
         override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
             if (url.host != "hmail.fiacloud.top") return
-            cookies.firstOrNull { it.name == "hmail_session" }?.let { vault.write("session", if (it.expiresAt <= System.currentTimeMillis()) null else it.toString()) }
+            cookies.firstOrNull { it.name == "hmail_session" }?.let {
+                sessionCookie = it.takeIf { cookie -> cookie.expiresAt > System.currentTimeMillis() }
+                vault.write("session", sessionCookie?.toString())
+            }
         }
         override fun loadForRequest(url: HttpUrl): List<Cookie> {
             if (url.host != "hmail.fiacloud.top" || !url.isHttps) return emptyList()
-            val cookie = vault.read("session")?.let { Cookie.parse(url, it) } ?: return emptyList()
+            val cookie = sessionCookie ?: return emptyList()
             return if (cookie.matches(url) && cookie.expiresAt > System.currentTimeMillis()) listOf(cookie) else emptyList()
         }
     }
     private val client = OkHttpClient.Builder().cookieJar(cookies).followRedirects(false)
         .retryOnConnectionFailure(false).connectTimeout(20, TimeUnit.SECONDS).readTimeout(90, TimeUnit.SECONDS).build()
-    fun clear() { csrf = ""; vault.write("session", null); vault.write("oauth", null) }
+    fun clear() { csrf = ""; sessionCookie = null; vault.write("session", null); vault.write("oauth", null) }
     private suspend fun execute(request: Request): ByteArray = suspendCancellableCoroutine { continuation ->
         val call = client.newCall(request)
         continuation.invokeOnCancellation { call.cancel() }
@@ -93,6 +106,8 @@ class MailApi(private val vault: Vault) {
         })
     }
     private fun request(path: String, method: String, body: RequestBody? = null, ticket: String? = null): Request {
+        if (method != "GET" && csrf.isBlank() && !path.startsWith("/auth/"))
+            throw ApiFailure("session_unavailable", 0, "请联网恢复会话后重试")
         val builder = Request.Builder().url(SERVER + "/api/v1" + path).header("Accept", "application/json")
         if (method != "GET") builder.header("Origin", SERVER).header("X-CSRF-Token", csrf)
         ticket?.let { builder.header("X-OAuth-Ticket", it) }
@@ -100,13 +115,14 @@ class MailApi(private val vault: Vault) {
     }
     suspend fun call(path: String, method: String = "GET", data: JSONObject? = null, ticket: String? = null): Any {
         val bytes = execute(request(path, method, data?.toString()?.toRequestBody("application/json; charset=utf-8".toMediaType()), ticket))
-        return JSONTokener(String(bytes, Charsets.UTF_8)).nextValue()
+        return withContext(Dispatchers.Default) { JSONTokener(String(bytes, Charsets.UTF_8)).nextValue() }
     }
     suspend fun json(path: String, method: String = "GET", data: JSONObject? = null) = call(path, method, data) as JSONObject
     suspend fun list(path: String) = (call(path) as JSONArray).objects()
     suspend fun upload(aid: String, name: String, type: String, bytes: ByteArray): Attachment {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM).addFormDataPart("file", name, bytes.toRequestBody(type.toMediaType())).build()
-        return Attachment.from(JSONObject(String(execute(request("/gmail-accounts/${enc(aid)}/attachments", "POST", body)), Charsets.UTF_8)))
+        val responseBytes = execute(request("/gmail-accounts/${enc(aid)}/attachments", "POST", body))
+        return withContext(Dispatchers.Default) { Attachment.from(JSONObject(String(responseBytes, Charsets.UTF_8))) }
     }
     suspend fun download(path: String) = execute(request(path, "GET"))
 }
