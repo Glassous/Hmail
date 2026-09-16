@@ -82,11 +82,19 @@ _guard = threading.Lock()
 _shutdown = threading.Event()
 
 
+def close(client):
+    """Closing a pooled connection must never turn a finished operation into a failure."""
+    try:
+        client.close()
+    except Exception:
+        log.warning('imap_close_failed')
+
+
 def discard_account(aid):
     with _guard:
         clients = [entry[0] for key in list(_pool) if key[0] == aid for entry in _pool.pop(key)]
     for client in clients:
-        client.close()
+        close(client)
 
 
 def reap():
@@ -104,7 +112,7 @@ def reap():
             else:
                 del _pool[key]
     for client in expired:
-        client.close()
+        close(client)
 
 
 def _reaper():
@@ -128,7 +136,7 @@ def imap_client(account, factory, lane):
             client._ok(client.imap.noop())
             log.info('imap_connection_reused=1')
         except Exception:
-            client.close()
+            close(client)
             client = None
     if client is None:
         client = factory()
@@ -136,7 +144,7 @@ def imap_client(account, factory, lane):
     try:
         yield client
     except BaseException:
-        client.close()
+        close(client)
         raise
     else:
         with _guard:
@@ -145,4 +153,4 @@ def imap_client(account, factory, lane):
                 entries.append((client, time.monotonic()))
                 client = None
         if client:
-            client.close()
+            close(client)

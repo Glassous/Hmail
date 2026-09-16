@@ -303,10 +303,34 @@ def invalidate(user_id, aid):
     cache.incr(f'mail-version:{aid}')
 
 
+def refresh_all_mailboxes(user_id, priority=20):
+    """Queue a sync for every folder of every connected mailbox: refreshes mail and the database index."""
+    if not indexing.ENABLED:
+        return {'accounts': 0, 'jobs': 0}
+    with Session() as db:
+        accounts = db.scalars(select(Account).where(Account.user_id == user_id, Account.status == 'connected')).all()
+        folders = {account.id: list(db.scalars(select(MailFolder.folder).where(MailFolder.account_id == account.id))) for account in accounts}
+    jobs = 0
+    for account in accounts:
+        for name in dict.fromkeys(['INBOX', 'SENT', 'DRAFT', *folders.get(account.id, [])]):
+            try:
+                indexing.enqueue(account.id, name, priority, True)
+                jobs += 1
+            except Exception:
+                log.warning('refresh_enqueue_failed aid=%s', account.id)
+    return {'accounts': len(accounts), 'jobs': jobs}
+
+
+def delivered(provider):
+    """True once the provider confirmed the message left the outbox."""
+    return bool(getattr(provider, 'delivered', False))
+
+
 @contextmanager
 def provider_for(user, aid, lane='read'):
     with admission(aid, lane) as lost:
         account = account_for(user, aid)
+        provider = None
         try:
             if account.provider == 'oauth':
                 from google.oauth2.credentials import Credentials as GoogleCredentials
@@ -328,20 +352,30 @@ def provider_for(user, aid, lane='read'):
                 try:
                     yield provider, account
                 finally:
-                    provider.close()
+                    try:
+                        provider.close()
+                    except Exception:
+                        log.warning('provider_close_failed aid=%s', aid)
             else:
-                with imap_client(account, lambda: ImapSmtpProvider(account.email, decrypt(account.secret)), lane) as provider:
+                with imap_client(account, lambda: ImapSmtpProvider(account.email, decrypt(account.secret)), lane) as client:
+                    provider = client
                     yield provider, account
-                    latest = account_for(user, aid)
-                    if latest.credential_version != account.credential_version or lost.is_set():
-                        raise MailError('邮箱连接已更新，请重试', 'account_changed', 409)
+                    # A message that already left the outbox must never be reported as failed
+                    # just because the lease was lost or the credentials rotated mid-flight.
+                    if not delivered(provider):
+                        latest = account_for(user, aid)
+                        if latest.credential_version != account.credential_version or lost.is_set():
+                            raise MailError('邮箱连接已更新，请重试', 'account_changed', 409)
         except (RefreshError, smtplib.SMTPAuthenticationError):
             with Session() as db:
                 db.execute(update(Account).where(Account.id == aid, Account.credential_version == account.credential_version).values(status='reconnect'))
                 db.commit()
             raise MailError('邮箱连接已失效，请重新连接', 'reconnect', 401) from None
         except (TimeoutError, OSError, imaplib.IMAP4.abort):
-            raise MailError('连接邮箱超时，请稍后重试', 'network', 502) from None
+            if delivered(provider):
+                log.warning('post_delivery_cleanup_failed aid=%s', aid)
+            else:
+                raise MailError('连接邮箱超时，请稍后重试', 'network', 502) from None
 
 
 def save_account(user, email, kind, secret):
@@ -1016,19 +1050,135 @@ def draft_delete(aid: str, did: str, user=Depends(current_user)):
     return {'ok': True}
 
 
+def _message_id_of(operation):
+    if not operation:
+        return ''
+    try:
+        payload = json.loads(operation.result or '{}')
+    except ValueError:
+        return ''
+    return payload.get('messageId', '') if isinstance(payload, dict) else ''
+
+
+def _confirm_send(provider, operation):
+    """Verify a send whose result is unknown. Returns the confirmed success response, or None."""
+    message_id = _message_id_of(operation)
+    find_sent = getattr(provider, 'find_sent', None)
+    if not message_id or not find_sent:
+        return None
+    try:
+        found = find_sent(message_id)
+    except Exception:
+        return None
+    if not found:
+        return None
+    response = {'status': 'sent', 'result': {'id': message_id, 'refused': [], 'confirmed': True}}
+    try:
+        with Session.begin() as db:
+            stored = db.get(ComposeOperation, operation.key)
+            if stored and stored.send_status == 'pending':
+                stored.send_status, stored.result = 'sent', json.dumps(response)
+    except Exception:
+        log.warning('send_confirm_persist_failed')
+    return response
+
+
+def _clear_pending(key):
+    """A send that provably never left the outbox must not lock the compose session."""
+    try:
+        with Session.begin() as db:
+            operation = db.get(ComposeOperation, key)
+            if operation and operation.send_status == 'pending':
+                operation.send_status, operation.result = '', '{}'
+    except Exception:
+        log.warning('send_pending_clear_failed')
+
+
+def _post_send(provider, user, aid, key, data, draft_warning=True):
+    """Best-effort cleanup after a delivered message; never raises."""
+    warnings = []
+    try:
+        with Session() as db:
+            operation = db.get(ComposeOperation, key)
+            draft = json.loads(operation.draft) if operation and operation.draft else {}
+        did = (draft or {}).get('id') or data.draftId
+        if did:
+            provider.draft_delete(did)
+    except Exception:
+        if draft_warning:
+            warnings.append('邮件已发送，但旧草稿未清理，请手动检查草稿箱')
+    for ref in data.attachments:
+        if ref.messageId:
+            continue
+        try:
+            cache.delete('upload:' + ref.id)
+            (UPLOAD_DIR / ref.id).unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        invalidate(user.id, aid)
+    except Exception:
+        pass
+    return warnings
+
+
+def _sent_response(provider, user, aid, key, data, result, extra=(), draft_warning=True):
+    """Everything after the message left the outbox; failures here must never fake a send error."""
+    provider.delivered = True
+    response = {'status': 'sent', 'result': result}
+    warnings = [result.get('warning')] if isinstance(result, dict) and result.get('warning') else []
+    warnings.extend(extra)
+    try:
+        with Session.begin() as db:
+            operation = db.get(ComposeOperation, key)
+            if operation:
+                operation.send_status, operation.result = 'sent', json.dumps(response)
+    except Exception:
+        log.warning('send_state_persist_failed aid=%s', aid)
+    warnings.extend(_post_send(provider, user, aid, key, data, draft_warning))
+    if warnings:
+        response['warning'] = '；'.join(warning for warning in warnings if warning)
+        try:
+            with Session.begin() as db:
+                operation = db.get(ComposeOperation, key)
+                if operation and operation.send_status == 'sent':
+                    operation.result = json.dumps(response)
+        except Exception:
+            pass
+    try:
+        refresh_all_mailboxes(user.id)
+    except Exception:
+        log.warning('send_refresh_failed aid=%s', aid)
+    return response
+
+
+def _replay(operation):
+    try:
+        result = json.loads(operation.result)
+    except ValueError:
+        result = None
+    return result if isinstance(result, dict) and result.get('status') else {'status': 'sent', 'result': {}}
+
+
 @app.post(PREFIX + '/gmail-accounts/{aid}/send')
 def send(aid: str, data: Compose, request: Request, user=Depends(current_user)):
     limited(request, 'send', user.id, 30, 3600)
     envelope = recipients(data.model_dump())
+    key = indexing.key(aid, data.composeId)
     with provider_for(user, aid, 'write') as (provider, account):
-        key = indexing.key(aid, data.composeId)
         with Session() as db:
             operation = db.get(ComposeOperation, key)
-            if operation and operation.send_status:
-                if operation.send_status == 'sent':
-                    return json.loads(operation.result)
-                raise MailError('此邮件的发送结果尚不明确，请检查已发送，勿重复发送', 'send_uncertain', 409)
+        if operation and operation.send_status:
+            if operation.send_status == 'sent':
+                return _replay(operation)
+            if operation.send_status == 'pending':
+                # Don't make the user wait: prove the message is in the sent folder, or refuse.
+                confirmed = _confirm_send(provider, operation)
+                if confirmed:
+                    return _sent_response(provider, user, aid, key, data, confirmed['result'], extra=['发送结果已确认：邮件此前已成功发出'], draft_warning=False)
+            raise MailError('此邮件的发送结果尚不明确，请检查已发送，勿重复发送', 'send_uncertain', 409)
         msg = materialize(data, user, aid, provider, account.email)
+        indexing.fence_write(aid)
         # Commit before contacting SMTP/Gmail. A crash can never make this retryable.
         with Session.begin() as db:
             operation = db.get(ComposeOperation, key)
@@ -1036,38 +1186,57 @@ def send(aid: str, data: Compose, request: Request, user=Depends(current_user)):
                 operation = ComposeOperation(key=key, account_id=aid)
                 db.add(operation)
             operation.send_status = 'pending'
-        indexing.fence_write(aid)
+            operation.result = json.dumps({'messageId': str(msg['Message-ID'])})
         try:
             result = provider.send(msg, envelope, data.threadId)
+        except MailError as exc:
+            if exc.code == 'send_uncertain':
+                with Session() as db:
+                    operation = db.get(ComposeOperation, key)
+                confirmed = _confirm_send(provider, operation)
+                if confirmed:
+                    return _sent_response(provider, user, aid, key, data, confirmed['result'], extra=['发送结果已确认：邮件其实已经发出'])
+                raise
+            # Connection, configuration or a clear rejection: nothing was delivered, allow a retry.
+            _clear_pending(key)
+            raise
+        except smtplib.SMTPAuthenticationError:
+            # Login failed before any message was handed over; let provider_for flag the account.
+            _clear_pending(key)
+            raise
         except Exception:
             raise MailError('发送结果尚不明确，请检查已发送后再决定是否重新撰写', 'send_uncertain', 409) from None
-        response = {'status': 'sent', 'result': result}
-        if result.get('warning'):
-            response['warning'] = result['warning']
-        with Session.begin() as db:
-            operation = db.get(ComposeOperation, key)
-            operation.send_status, operation.result = 'sent', json.dumps(response)
-        did = data.draftId
-        draft_state = json.loads(operation.draft)
-        if draft_state:
-            did = draft_state['id']
-        if did:
-            try:
-                provider.draft_delete(did)
-            except Exception:
-                response['warning'] = '邮件已发送，但旧草稿未清理，请手动检查草稿箱'
-        for ref in data.attachments:
-            if not ref.messageId:
-                cache.delete('upload:' + ref.id)
-                (UPLOAD_DIR / ref.id).unlink(missing_ok=True)
-        invalidate(user.id, aid)
-        with Session.begin() as db:
-            operation = db.get(ComposeOperation, key)
-            operation.result = json.dumps(response)
-        if indexing.ENABLED:
-            indexing.enqueue(aid, 'SENT', 20)
-            indexing.enqueue(aid, 'DRAFT', 20)
-        return response
+        return _sent_response(provider, user, aid, key, data, result)
+
+
+@app.post(PREFIX + '/sync-all')
+def sync_all(user=Depends(current_user)):
+    """Refresh every connected mailbox of this platform account (mail server + database index)."""
+    if not indexing.JOBS_ENABLED:
+        raise MailError('后台同步接口未启用', 'unsupported', 404)
+    return refresh_all_mailboxes(user.id)
+
+
+@app.get(PREFIX + '/gmail-accounts/{aid}/send-status')
+def send_status(aid: str, composeId: str = '', user=Depends(current_user)):
+    """Resolve an uncertain send: replay when sent, verify against the sent folder when pending."""
+    account_for(user, aid)
+    if not composeId:
+        raise MailError('缺少写信会话标识', 'validation', 422)
+    key = indexing.key(aid, composeId)
+    with Session() as db:
+        operation = db.get(ComposeOperation, key)
+    if not operation or not operation.send_status:
+        return {'status': 'none'}
+    if operation.send_status == 'sent':
+        return {'status': 'sent', 'result': _replay(operation)}
+    if operation.send_status != 'pending':
+        return {'status': operation.send_status}
+    with provider_for(user, aid, 'read') as (provider, _):
+        confirmed = _confirm_send(provider, operation)
+    if confirmed:
+        return {'status': 'sent', 'result': confirmed}
+    return {'status': 'pending'}
 
 
 @app.post(PREFIX + '/gmail-accounts/{aid}/sync-jobs', status_code=202)

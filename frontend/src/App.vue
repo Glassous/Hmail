@@ -34,7 +34,7 @@ function stashCompose() {
 let saveTimer: ReturnType<typeof setTimeout> | undefined, toastTimer: ReturnType<typeof setTimeout> | undefined, codeTimer: ReturnType<typeof setInterval> | undefined
 let savePromise: Promise<void> | null = null, loadGeneration = 0, readGeneration = 0
 let listAbort: AbortController | undefined, readAbort: AbortController | undefined
-let syncTimer: ReturnType<typeof setTimeout> | undefined, syncGeneration = 0
+let syncTimer: ReturnType<typeof setTimeout> | undefined, syncGeneration = 0, sendCheckTimer: ReturnType<typeof setTimeout> | undefined
 const indexVersion = ref(0)
 const pendingActions = reactive(new Set<string>())
 const mutationVersions = new Map<string, number>()
@@ -281,8 +281,19 @@ async function uploadFiles(event:Event) { const input=event.target as HTMLInputE
 async function sendMail() {
   if(composingBusy.value||uploading.value||sendUncertain.value)return
   clearTimeout(saveTimer);if(savePromise)await savePromise;composingBusy.value=true
-  try{const result=await api(path('/send',composeAccount.value),'POST',draft);composer.value=false;composeDirty.value=false;toast(result.warning||(result.result?.refused?.length?'邮件已发送，但部分收件人被拒绝：'+result.result.refused.join(', '):'邮件已发送'));await loadList()}
-  catch(e){if(e instanceof ApiError&&e.code==='send_uncertain'){sendUncertain.value=true;savedState.value='发送结果待确认'}fail(e)}finally{composingBusy.value=false}
+  try{const result=await api(path('/send',composeAccount.value),'POST',draft);composer.value=false;composeDirty.value=false;toast(result.warning||(result.result?.refused?.length?'邮件已发送，但部分收件人被拒绝：'+result.result.refused.join(', '):'邮件已发送'));await loadList();void refresh(false)}
+  catch(e){if(e instanceof ApiError&&e.code==='send_uncertain'){sendUncertain.value=true;savedState.value='发送结果待确认，正在自动核对';void verifySend()}fail(e)}finally{composingBusy.value=false}
+}
+async function verifySend(attempt=0) {
+  if(!sendUncertain.value||attempt>5)return
+  const aid=composeAccount.value,cid=draft.composeId
+  try {
+    const state=await api<{status:string;result?:any}>(path('/send-status',aid)+'?composeId='+encodeURIComponent(cid))
+    if(!sendUncertain.value||composeAccount.value!==aid||draft.composeId!==cid)return
+    if(state.status==='sent'){sendUncertain.value=false;composer.value=false;composeDirty.value=false;error.value='';toast(state.result?.warning||'邮件已确认发送成功');await loadList();void refresh(false);return}
+    if(state.status!=='pending'){sendUncertain.value=false;savedState.value=state.status==='none'?'未发送，可重新编辑后发送':'可直接继续编辑';return}
+  } catch {}
+  sendCheckTimer=setTimeout(()=>void verifySend(attempt+1),4000)
 }
 function beforeUnload(e:BeforeUnloadEvent) {if(composer.value&&(composeDirty.value||composingBusy.value||uploading.value)){e.preventDefault();e.returnValue=''}}
 onMounted(async()=>{
@@ -314,7 +325,7 @@ onUnmounted(()=>{
   clearTimeout(saveTimer)
   clearTimeout(toastTimer)
   clearInterval(codeTimer)
-  clearTimeout(syncTimer);listAbort?.abort();readAbort?.abort();++syncGeneration
+  clearTimeout(syncTimer);clearTimeout(sendCheckTimer);listAbort?.abort();readAbort?.abort();++syncGeneration
   systemMedia?.removeEventListener('change', applyTheme)
   window.removeEventListener('beforeunload', beforeUnload)
 })
@@ -487,7 +498,7 @@ onUnmounted(()=>{
 
   <ComposeDialog :open="composeVisible" @stash="stashCompose">
     <header class="flex shrink-0 flex-wrap items-center justify-between gap-y-2 bg-[#eaf0fa] px-5 py-3 dark:bg-slate-800"><h2 class="shrink-0 text-sm font-medium">新邮件</h2><span class="ml-auto mr-3 text-[11px] text-slate-400" aria-live="polite">{{savedState}}</span><button class="mr-3 rounded-lg px-2 py-1 text-xs text-blue-600 dark:text-blue-300" @click="stashCompose">收起</button><button class="text-slate-500" aria-label="保存并关闭" v-tip="'保存并关闭'" :disabled="composingBusy||uploading" @click="closeCompose"><Icon name="close" :size="18"/></button></header>
-    <form class="flex min-h-0 flex-1 flex-col" @submit.prevent="sendMail"><div class="min-h-0 overflow-y-auto px-5"><div class="border-b divider py-3 text-xs text-slate-400">发件人 <span class="ml-3 text-slate-600 dark:text-slate-300">{{accounts.find(a=>a.id===composeAccount)?.email}}</span></div><label v-for="field in (['to','cc','bcc'] as const)" :key="field" class="flex items-center border-b divider text-sm text-slate-400"><span class="w-14 shrink-0">{{field==='to'?'收件人':field==='cc'?'抄送':'密送'}}</span><input v-model="draft[field]" :disabled="sendUncertain" class="w-full bg-transparent py-3 text-slate-700 focus-visible:ring-0 dark:text-slate-200" :aria-label="field" @input="dirty"/></label><input v-model="draft.subject" :disabled="sendUncertain" class="w-full border-b divider bg-transparent py-3 text-sm focus-visible:ring-0" placeholder="主题" aria-label="邮件主题" @input="dirty"/><textarea v-model="draft.text" :disabled="sendUncertain" class="min-h-[240px] w-full resize-y bg-transparent py-4 text-sm leading-7 focus-visible:ring-0" placeholder="写下你的邮件…" aria-label="邮件正文" @input="dirty"></textarea><div class="mb-3 flex flex-wrap gap-2"><div v-for="(attachment,index) in draft.attachments" :key="attachment.id" class="flex max-w-full items-center gap-2 rounded-lg bg-slate-100 px-3 py-2 text-xs dark:bg-slate-800"><Icon name="attachment" :size="14"/><span class="max-w-[230px] truncate">{{attachment.name}}</span><span class="text-slate-400">{{sizeText(attachment.size)}}</span><button type="button" :disabled="sendUncertain" aria-label="移除附件" @click="draft.attachments.splice(index,1);dirty()"><Icon name="close" :size="13"/></button></div></div></div><p v-if="sendUncertain" class="mx-5 mb-3 rounded-lg bg-amber-50 p-3 text-xs leading-6 text-amber-700">发送结果待确认。请先查看已发送文件夹；此窗口已禁止再次发送。</p><footer class="flex shrink-0 flex-wrap items-center gap-3 border-t divider p-4"><button class="primary" :disabled="composingBusy||uploading||sendUncertain"><Icon name="send" :size="16"/>{{composingBusy?'处理中…':'发送'}}</button><label class="icon-btn cursor-pointer" aria-label="添加附件" v-tip="'添加附件'"><Icon :name="uploading?'refresh':'attachment'" :class="uploading?'animate-spin':''"/><input type="file" multiple class="sr-only" :disabled="composingBusy||uploading||sendUncertain" @change="uploadFiles"/></label><button type="button" class="text-xs text-slate-400" :disabled="composingBusy||uploading||sendUncertain" @click="saveDraft">保存草稿</button><button type="button" class="icon-btn ml-auto" :disabled="composingBusy||uploading" aria-label="丢弃草稿" v-tip="'丢弃草稿'" @click="discardCompose"><Icon name="trash" :size="18"/></button></footer></form>
+    <form class="flex min-h-0 flex-1 flex-col" @submit.prevent="sendMail"><div class="min-h-0 overflow-y-auto px-5"><div class="border-b divider py-3 text-xs text-slate-400">发件人 <span class="ml-3 text-slate-600 dark:text-slate-300">{{accounts.find(a=>a.id===composeAccount)?.email}}</span></div><label v-for="field in (['to','cc','bcc'] as const)" :key="field" class="flex items-center border-b divider text-sm text-slate-400"><span class="w-14 shrink-0">{{field==='to'?'收件人':field==='cc'?'抄送':'密送'}}</span><input v-model="draft[field]" :disabled="sendUncertain" class="w-full bg-transparent py-3 text-slate-700 focus-visible:ring-0 dark:text-slate-200" :aria-label="field" @input="dirty"/></label><input v-model="draft.subject" :disabled="sendUncertain" class="w-full border-b divider bg-transparent py-3 text-sm focus-visible:ring-0" placeholder="主题" aria-label="邮件主题" @input="dirty"/><textarea v-model="draft.text" :disabled="sendUncertain" class="min-h-[240px] w-full resize-y bg-transparent py-4 text-sm leading-7 focus-visible:ring-0" placeholder="写下你的邮件…" aria-label="邮件正文" @input="dirty"></textarea><div class="mb-3 flex flex-wrap gap-2"><div v-for="(attachment,index) in draft.attachments" :key="attachment.id" class="flex max-w-full items-center gap-2 rounded-lg bg-slate-100 px-3 py-2 text-xs dark:bg-slate-800"><Icon name="attachment" :size="14"/><span class="max-w-[230px] truncate">{{attachment.name}}</span><span class="text-slate-400">{{sizeText(attachment.size)}}</span><button type="button" :disabled="sendUncertain" aria-label="移除附件" @click="draft.attachments.splice(index,1);dirty()"><Icon name="close" :size="13"/></button></div></div></div><p v-if="sendUncertain" class="mx-5 mb-3 rounded-lg bg-amber-50 p-3 text-xs leading-6 text-amber-700">发送结果待确认，正在自动核对…请勿重复发送；也可稍后在“已发送”中确认。</p><footer class="flex shrink-0 flex-wrap items-center gap-3 border-t divider p-4"><button class="primary" :disabled="composingBusy||uploading||sendUncertain"><Icon name="send" :size="16"/>{{composingBusy?'处理中…':'发送'}}</button><label class="icon-btn cursor-pointer" aria-label="添加附件" v-tip="'添加附件'"><Icon :name="uploading?'refresh':'attachment'" :class="uploading?'animate-spin':''"/><input type="file" multiple class="sr-only" :disabled="composingBusy||uploading||sendUncertain" @change="uploadFiles"/></label><button type="button" class="text-xs text-slate-400" :disabled="composingBusy||uploading||sendUncertain" @click="saveDraft">保存草稿</button><button type="button" class="icon-btn ml-auto" :disabled="composingBusy||uploading" aria-label="丢弃草稿" v-tip="'丢弃草稿'" @click="discardCompose"><Icon name="trash" :size="18"/></button></footer></form>
   </ComposeDialog>
   <button v-if="user && composer && composeStashed" class="compose-stash surface" aria-label="恢复暂存邮件" @click="restoreCompose">
     <span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-blue-100 text-blue-600 dark:bg-blue-900/40 dark:text-blue-300"><Icon name="edit" :size="19"/></span>

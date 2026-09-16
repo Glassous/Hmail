@@ -24,6 +24,7 @@ from .mail import MailError, b64, unb64, parse_message, extract_attachment
 class MailProvider(Protocol):
     """Shared mail interface; provider message IDs are opaque to the application."""
     def close(self): ...
+    def find_sent(self, message_id): ...
     def labels(self): ...
     def label(self, action, identifier, name): ...
     def list(self, folder='INBOX', query='', cursor=''): ...
@@ -34,6 +35,7 @@ class MailProvider(Protocol):
     def thread_modify(self, identifiers, add, remove, action): ...
     def move(self, identifier, trash=True): ...
     def send(self, msg, envelope, thread_id=None): ...
+    def find_sent(self, message_id): ...
     def drafts(self): ...
     def draft_get(self, identifier): ...
     def draft_save(self, msg, identifier=None, thread_id=None): ...
@@ -170,7 +172,23 @@ class GmailApiProvider:
         body = {'raw': b64(msg.as_bytes())}
         if thread_id:
             body['threadId'] = thread_id
-        return self.run(self.users.messages().send(userId='me', body=body), retry=False)
+        try:
+            return self.run(self.users.messages().send(userId='me', body=body), retry=False)
+        except MailError:
+            raise
+        except Exception:
+            # A transport error after the request was handed to Google may still have delivered.
+            raise MailError('发送结果尚不明确，请检查已发送后再决定是否重新撰写', 'send_uncertain', 409) from None
+
+    def find_sent(self, message_id):
+        """True/False when the sent mailbox can be checked, None when it cannot be verified."""
+        if not message_id:
+            return False
+        try:
+            result = self.run(self.users.messages().list(userId='me', q='rfc822msgid:' + message_id, maxResults=1))
+        except MailError:
+            return None
+        return bool(result.get('messages'))
 
     def drafts(self):
         result = self.run(self.users.drafts().list(userId='me', maxResults=100))
@@ -721,8 +739,7 @@ class ImapSmtpProvider:
 
     # -- outgoing --------------------------------------------------------------
 
-    @contextmanager
-    def smtp(self):
+    def _smtp_connection(self):
         config = self.secret.get('smtp') or DEFAULT_SMTP
         try:
             host, port = str(config['host']), int(config['port'])
@@ -730,20 +747,36 @@ class ImapSmtpProvider:
             raise MailError('SMTP 服务器配置不完整，请重新连接', 'configuration', 422) from None
         security = config.get('security', 'ssl')
         if security == 'ssl':
-            connection = smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30)
-        else:
-            connection = smtplib.SMTP(host, port, timeout=30)
-            connection.ehlo()
-            connection.starttls(context=ssl.create_default_context())
-            connection.ehlo()
+            return smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30)
+        connection = smtplib.SMTP(host, port, timeout=30)
+        connection.ehlo()
+        connection.starttls(context=ssl.create_default_context())
+        connection.ehlo()
+        return connection
+
+    @staticmethod
+    def _smtp_close(connection):
+        # Closing the socket must never turn a finished delivery into a failure.
+        try:
+            connection.quit()
+        except Exception:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    @contextmanager
+    def smtp(self):
+        connection = self._smtp_connection()
         try:
             connection.login(self.email, self.secret['password'])
+        except Exception:
+            self._smtp_close(connection)
+            raise
+        try:
             yield connection
         finally:
-            try:
-                connection.quit()
-            except Exception:
-                connection.close()
+            self._smtp_close(connection)
 
     def validate(self):
         with self.smtp():
@@ -753,14 +786,52 @@ class ImapSmtpProvider:
         msg['Date'] = formatdate(localtime=False)
         if 'Bcc' in msg:
             del msg['Bcc']
-        with self.smtp() as smtp:
-            refused = smtp.sendmail(self.email, envelope, msg.as_bytes())
+        raw = msg.as_bytes()
+        try:
+            connection = self._smtp_connection()
+        except MailError:
+            raise
+        except Exception:
+            raise MailError('无法连接发信服务器，邮件未发送，请稍后重试', 'send_failed', 502) from None
+        try:
+            connection.login(self.email, self.secret['password'])
+            try:
+                refused = connection.sendmail(self.email, envelope, raw)
+            except smtplib.SMTPResponseException as exc:
+                # The server answered with a rejection: the message was not delivered.
+                detail = getattr(exc, 'smtp_error', b'') or b''
+                detail = detail.decode('utf-8', 'replace').strip() if isinstance(detail, bytes) else str(detail).strip()
+                reason = '（' + detail[:120] + '）' if detail else ''
+                raise MailError('发信服务器拒绝了这封邮件，邮件未发送' + reason, 'send_failed', 422) from None
+            except Exception:
+                # Transport failed somewhere between DATA and the response: delivery is unknown.
+                raise MailError('发送结果尚不明确，请检查已发送后再决定是否重新撰写', 'send_uncertain', 409) from None
+        finally:
+            self._smtp_close(connection)
         result = {'id': str(msg['Message-ID']), 'refused': list(refused)}
         try:
             self._append(quote(self.folder_wire('SENT')), msg, '\\Seen')
         except Exception:
             result['warning'] = '邮件已发送，但未能保存到已发送文件夹，请在服务端确认'
         return result
+
+    def find_sent(self, message_id):
+        """True/False when the sent mailbox can be checked, None when it cannot be verified.
+
+        A copy is appended to the sent folder only after SMTP accepted the message,
+        so finding it proves the message was delivered.
+        """
+        if not message_id:
+            return False
+        try:
+            wire = self.folder_wire('SENT')
+        except MailError:
+            return None
+        try:
+            self._select(wire)
+            return bool(self._search(b'HEADER', b'Message-ID', message_id.encode('utf-8', 'replace')))
+        except Exception:
+            return None
 
     # -- drafts ----------------------------------------------------------------
 
