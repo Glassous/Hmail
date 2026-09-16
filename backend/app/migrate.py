@@ -1,6 +1,17 @@
 """Versioned, transactional schema bootstrap; append migrations for future changes."""
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy import text
 from .core import Base, decrypt, encrypt, engine
+
+
+def _backfill_account_created_at(conn):
+    """旧数据没有创建时间：按最近访问时间近似还原先后，保证列表里越早的邮箱越靠上。"""
+    base = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    rows = conn.execute(text('SELECT id FROM gmail_accounts ORDER BY accessed_at ASC, id ASC')).fetchall()
+    for index, (identifier,) in enumerate(rows):
+        conn.execute(text('UPDATE gmail_accounts SET created_at = :created WHERE id = :id'),
+                     {'created': base + timedelta(seconds=index), 'id': identifier})
 
 
 def _upgrade_imap_secrets(conn):
@@ -46,6 +57,14 @@ def migrate():
             if 'default_account_id' not in columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN default_account_id VARCHAR(36) NOT NULL DEFAULT ''"))
             conn.execute(text('INSERT INTO schema_migrations(version) VALUES (4)'))
+        if not conn.execute(text('SELECT version FROM schema_migrations WHERE version=5')).first():
+            from sqlalchemy import inspect
+            columns = {column['name'] for column in inspect(conn).get_columns('gmail_accounts')}
+            if 'created_at' not in columns:
+                # 不能在这里用 CURRENT_TIMESTAMP 作默认值：SQLite 的 ADD COLUMN 不接受它。
+                conn.execute(text('ALTER TABLE gmail_accounts ADD COLUMN created_at TIMESTAMP WITH TIME ZONE'))
+            _backfill_account_created_at(conn)
+            conn.execute(text('INSERT INTO schema_migrations(version) VALUES (5)'))
 
 
 if __name__ == '__main__':

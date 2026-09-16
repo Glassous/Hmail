@@ -50,6 +50,7 @@ import com.glassous.hmail.ui.common.PrimaryAction
 import com.glassous.hmail.ui.common.SecondaryAction
 import com.glassous.hmail.ui.common.SectionText
 import com.glassous.hmail.ui.common.SectionTitle
+import com.glassous.hmail.ui.common.SplitRow
 import com.glassous.hmail.ui.common.TextAction
 import com.glassous.hmail.ui.theme.HmailTheme
 import org.json.JSONObject
@@ -65,11 +66,21 @@ fun AccountsScreen(model: MailModel, onBack: () -> Unit, onConnect: () -> Unit) 
             SectionText("尚未连接邮箱", muted = true)
         model.accounts.forEach { account ->
             SectionTitle(account.email)
+            if (account.isDefault) SectionText("默认邮箱", muted = true)
             if (account.status == "reconnect") SectionText("需要重新连接", muted = true)
-            SecondaryAction("重新连接") {
-                model.form("ConnectFragment")["email"] = account.email
-                onConnect()
-            }
+            SplitRow(
+                first = {
+                    SecondaryAction("重新连接") {
+                        model.form("ConnectFragment")["email"] = account.email
+                        onConnect()
+                    }
+                },
+                second = {
+                    SecondaryAction(if (account.isDefault) "取消默认" else "设为默认") {
+                        model.work { model.setDefaultAccount(if (account.isDefault) "" else account.id) }
+                    }
+                }
+            )
             Spacer(Modifier.height(8.dp))
             SecondaryAction("断开邮箱") { pending = account.id }
             Spacer(Modifier.height(16.dp))

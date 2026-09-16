@@ -127,7 +127,9 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         val owner = savedUser.str("id")
         if (owner.isBlank() || vault.read("local-mailbox-owner") != owner) return
         val savedAccounts = saved.array("accounts").objects().map(Account::from)
-        val aid = saved.str("active").takeIf { value -> savedAccounts.any { it.id == value } }
+        // 冷启动优先落在默认邮箱上；没有默认邮箱时才沿用上次选择的邮箱。
+        val aid = savedAccounts.firstOrNull { it.isDefault }?.id
+            ?: saved.str("active").takeIf { value -> savedAccounts.any { it.id == value } }
             ?: savedAccounts.firstOrNull()?.id.orEmpty()
         user = savedUser
         mailbox = MailboxState(accounts = savedAccounts, active = aid,
@@ -150,7 +152,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         val currentUser = user ?: return
         val snapshot = obj("version" to 1, "user" to JSONObject(currentUser.toString()),
             "accounts" to JSONArray(accounts.map { obj("id" to it.id, "email" to it.email,
-                "provider" to it.provider, "status" to it.status) }),
+                "provider" to it.provider, "status" to it.status, "isDefault" to it.isDefault) }),
             "active" to active, "folder" to folder, "query" to query,
             "labels" to JSONArray(labels.map { obj("id" to it.id, "name" to it.name, "type" to it.type) })).toString()
         cacheWrites.trySend { listCache.writeBootstrap(snapshot) }
@@ -241,8 +243,10 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
             mailbox = mailbox.copy(accounts = result, accountsLoading = false)
             val owner = user?.str("id").orEmpty()
             cacheWrites.trySend { listCache.retainAccounts(owner, result.map { it.id }.toSet()) }
-            if (result.none { it.id == active }) switchAccount(result.firstOrNull()?.id ?: "", sync)
-            else {
+            if (result.none { it.id == active }) {
+                // 当前邮箱已不存在时落到默认邮箱；没有默认邮箱则用列表里最早连接的邮箱。
+                switchAccount(result.firstOrNull { it.isDefault }?.id ?: result.firstOrNull()?.id ?: "", sync)
+            } else {
                 persistMailboxContext()
                 refreshLabels()
                 loadList(sync = sync, initial = true)
@@ -259,6 +263,11 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
                 mailbox = mailbox.copy(accountsLoading = false); changed()
             }
         }
+    }
+    /** 设置默认邮箱，传入空字符串表示取消默认。 */
+    suspend fun setDefaultAccount(id: String) {
+        api.json("/me/default-account", "PUT", obj("accountId" to id))
+        refreshAccounts()
     }
     fun retryAccounts() {
         if (mailbox.accountsLoading) return

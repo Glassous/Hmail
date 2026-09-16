@@ -9,7 +9,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, InvalidHashError
 from cryptography.fernet import Fernet
 from redis import Redis
-from sqlalchemy import create_engine, String, Text, Integer, ForeignKey, DateTime, Float, Index, Boolean, text
+from sqlalchemy import create_engine, String, Text, Integer, ForeignKey, DateTime, Float, Index, Boolean, text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 PUBLIC_URL = os.getenv('PUBLIC_URL', 'http://localhost:5173').rstrip('/')
@@ -62,6 +62,7 @@ class Account(Base):
     credential_version: Mapped[int] = mapped_column(Integer, default=1, server_default='1')
     write_revision: Mapped[int] = mapped_column(Integer, default=0, server_default='0')
     accessed_at: Mapped[float] = mapped_column(Float, default=0, server_default='0')
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), server_default=func.now())
 
 
 class MailFolder(Base):

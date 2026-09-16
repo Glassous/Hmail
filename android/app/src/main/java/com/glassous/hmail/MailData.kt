@@ -127,8 +127,8 @@ class MailApi(private val vault: Vault) {
     suspend fun download(path: String) = execute(request(path, "GET"))
 }
 
-data class Account(val id: String, val email: String, val provider: String, val status: String) {
-    companion object { fun from(j: JSONObject) = Account(j.str("id"), j.str("email"), j.str("provider"), j.str("status")) }
+data class Account(val id: String, val email: String, val provider: String, val status: String, val isDefault: Boolean = false) {
+    companion object { fun from(j: JSONObject) = Account(j.str("id"), j.str("email"), j.str("provider"), j.str("status"), j.optBoolean("isDefault")) }
 }
 data class MailLabel(val id: String, val name: String, val type: String) {
     companion object { fun from(j: JSONObject) = MailLabel(j.str("id"), j.str("name"), j.str("type")) }

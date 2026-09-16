@@ -356,11 +356,6 @@ def save_account(user, email, kind, secret):
                 account.provider, account.secret, account.status, account.sync_state = kind, encrypt(secret), 'connected', '{}'
                 account.credential_version += 1
                 indexing.clear_account(db, account.id)
-                default_id = user.default_account_id
-                if not default_id:
-                    # 首个连接的邮箱自动成为默认邮箱，用户之后可随时更改。
-                    default_id = account.id
-                    db.get(User, user.id).default_account_id = default_id
                 db.commit()
                 invalidate(user.id, account.id)
                 discard_account(account.id)
@@ -371,20 +366,19 @@ def save_account(user, email, kind, secret):
                 db.commit()
             except IntegrityError:
                 raise MailError('此邮箱已连接，请刷新', 'conflict', 409) from None
-            default_id = user.default_account_id
-            if not default_id:
-                default_id = account.id
-                db.get(User, user.id).default_account_id = default_id
-                db.commit()
     if indexing.ENABLED:
         indexing.enqueue(account.id, 'INBOX', 20)
-    return account_view(account, default_id)
+    # 连接/重连邮箱不改动默认邮箱：默认只能由用户显式设置或取消。
+    return account_view(account, user.default_account_id)
 
 
 @app.get(PREFIX + '/gmail-accounts')
 def accounts(user=Depends(current_user)):
     with Session() as db:
-        return [account_view(a, user.default_account_id) for a in db.scalars(select(Account).where(Account.user_id == user.id))]
+        # 固定按创建时间升序：先连接的邮箱在上，新连接的排在最后，与访问顺序无关。
+        # 旧版本进程写入的行可能没有创建时间，按「最新」处理放到末尾。
+        query = select(Account).where(Account.user_id == user.id).order_by(Account.created_at.asc().nulls_last(), Account.id.asc())
+        return [account_view(a, user.default_account_id) for a in db.scalars(query)]
 
 
 class DefaultAccount(BaseModel):
