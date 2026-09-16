@@ -1,7 +1,7 @@
 <script setup lang="ts">
 defineProps<{ name: string; size?: number }>()
 const paths: Record<string, string> = {
-  menu: 'M4 6h16M4 12h16M4 18h16', search: 'm21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
+  menu: 'M3 9h18M3 16h12', search: 'm21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
   mail: 'M3 5h18v14H3zM3 5l9 8 9-8', inbox: 'M4 3h16l2 12v6H2v-6L4 3ZM2 15h6l2 3h4l2-3h6',
   send: 'm22 2-7 20-4-9L2 9 22 2ZM22 2 11 13', edit: 'm16 3 5 5-12 12-6 1 1-6L16 3ZM13 6l5 5',
   star: 'm12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L2 9.6l6.2-.9L12 3Z',

@@ -12,8 +12,9 @@
 @layer base {
   body { @apply m-0 bg-[#f6f8fc] text-slate-800 antialiased dark:bg-[#10151e] dark:text-slate-200; }
   button { @apply cursor-pointer disabled:cursor-not-allowed disabled:opacity-40; }
-  button, input, select, textarea, a { @apply outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900; }
-  input, select, textarea { @apply min-w-0; }
+  button, a { @apply outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900; }
+  input, select, textarea { @apply min-w-0 outline-none; }
+  input:focus-visible, select:focus-visible, textarea:focus-visible { @apply ring-2 ring-blue-500/35 dark:ring-blue-400/45; }
   ::selection { @apply bg-blue-200 text-slate-900; }
 }
 @layer components {
@@ -36,4 +37,19 @@
   .compose-overlay { @apply fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/35 p-3 backdrop-blur-md dark:bg-black/50 sm:p-6; }
   .compose-dialog { @apply flex max-h-[90dvh] w-full max-w-[720px] flex-col overflow-hidden rounded-3xl border border-slate-200 shadow-2xl dark:border-slate-700; }
   .compose-stash { @apply fixed bottom-4 right-4 z-40 flex w-[320px] max-w-[calc(100vw-2rem)] items-center gap-3 rounded-2xl border border-blue-200 p-3 shadow-xl shadow-slate-900/10 transition hover:border-blue-400 dark:border-slate-600 dark:shadow-black/30; }
+  .tooltip-card {
+    @apply pointer-events-none fixed left-0 top-0 z-[80] max-w-[280px] rounded-xl bg-slate-800 px-3 py-2 text-center text-xs font-medium leading-5 text-white shadow-lg shadow-slate-900/25 dark:bg-slate-700;
+    opacity: 0;
+    transition: opacity .16s ease, transform .16s ease;
+  }
+  .tooltip-card[data-open="true"] { opacity: 1; }
+  .tooltip-card::after { content: ''; position: absolute; left: 50%; margin-left: -5px; border: 5px solid transparent; }
+  .tooltip-card[data-placement="bottom"] { transform: translateY(-4px) scale(.96); }
+  .tooltip-card[data-placement="bottom"][data-open="true"] { transform: translateY(0) scale(1); }
+  .tooltip-card[data-placement="top"] { transform: translateY(4px) scale(.96); }
+  .tooltip-card[data-placement="top"][data-open="true"] { transform: translateY(0) scale(1); }
+  .tooltip-card[data-placement="bottom"]::after { bottom: 100%; border-bottom-color: var(--color-slate-800); }
+  .tooltip-card[data-placement="top"]::after { top: 100%; border-top-color: var(--color-slate-800); }
+  .dark .tooltip-card[data-placement="bottom"]::after { border-bottom-color: var(--color-slate-700); }
+  .dark .tooltip-card[data-placement="top"]::after { border-top-color: var(--color-slate-700); }
 }
