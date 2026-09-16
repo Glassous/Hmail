@@ -2,21 +2,26 @@ package com.glassous.hmail.ui.common
 
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.ui.unit.dp
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import com.glassous.hmail.MailIcon
+
+/** 返回键 + 标题合用的胶囊最大宽度，与主页玻璃顶栏的尺度保持一致。 */
+private val BarMaxWidth = 220.dp
 
 /** Fixed, compact MD3 bar; its background stays transparent, including while scrolling. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -31,15 +36,28 @@ fun NativeTopBar(
 ) {
     TopAppBar(
         modifier = modifier,
-        title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-        navigationIcon = {
-            if (onNavigationClick != null) Surface(
-                modifier = Modifier.padding(start = 8.dp),
+        // 标题不再孤立在返回键右侧：返回键与标题合并进同一块不透明胶囊，整块随标题长度自适应。
+        title = {
+            Surface(
+                modifier = Modifier.widthIn(max = BarMaxWidth),
                 shape = RoundedCornerShape(percent = 50),
                 color = MaterialTheme.colorScheme.background.copy(alpha = 1f)
             ) {
-                IconButton(onClick = onNavigationClick) {
-                    MailIcon(navigationIcon, contentDescription = navigationDescription)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (onNavigationClick != null) {
+                        IconButton(onClick = onNavigationClick) {
+                            MailIcon(navigationIcon, contentDescription = navigationDescription)
+                        }
+                    }
+                    Text(
+                        text = title,
+                        modifier = Modifier.padding(
+                            start = if (onNavigationClick == null) 20.dp else 0.dp,
+                            end = 20.dp
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
         },

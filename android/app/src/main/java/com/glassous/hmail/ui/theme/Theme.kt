@@ -12,6 +12,7 @@ import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -66,6 +67,14 @@ private val LocalHmailColors = staticCompositionLocalOf { LightExtra }
 object HmailTheme {
     val colors: HmailColors
         @Composable @ReadOnlyComposable get() = LocalHmailColors.current
+
+    /**
+     * 顶部栏呼出的操作卡片的实色底：选中色叠加在页面背景上，保证完全不透明。
+     * 邮件详情页底部的回复入口一行复用同一底色，与卡片保持同一视觉。
+     */
+    val card: Color
+        @Composable @ReadOnlyComposable
+        get() = colors.selected.compositeOver(MaterialTheme.colorScheme.background).copy(alpha = 1f)
 }
 
 private val HmailTypography = Typography().let { base ->

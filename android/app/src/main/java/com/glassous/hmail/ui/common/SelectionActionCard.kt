@@ -21,7 +21,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.util.lerp
-import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.Dp
@@ -69,7 +68,7 @@ fun SelectionActionCard(
                 .then(if (!visible) Modifier.clearAndSetSemantics {} else Modifier)
                 .clickable(enabled = visible, interactionSource = remember { MutableInteractionSource() }, indication = null) {},
             shape = RoundedCornerShape(24.dp),
-            color = HmailTheme.colors.selected.compositeOver(MaterialTheme.colorScheme.background).copy(alpha = 1f),
+            color = HmailTheme.card,
             contentColor = HmailTheme.colors.onSelected
         ) {
             Column(Modifier.verticalScroll(scrollState, enabled = visible).padding(8.dp)) {

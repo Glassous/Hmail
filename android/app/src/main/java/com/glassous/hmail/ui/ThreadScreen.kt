@@ -10,12 +10,22 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -25,12 +35,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalViewConfiguration
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.glassous.hmail.Mail
+import com.glassous.hmail.MailIcon
 import com.glassous.hmail.MailModel
 import com.glassous.hmail.SERVER
 import com.glassous.hmail.enc
@@ -142,7 +156,6 @@ fun ThreadScreen(
                 ThreadMessage(
                     model = model,
                     mail = mail,
-                    starred = "STARRED" in mail.labels,
                     aid = aid,
                     context = context,
                     onDownloadAttachment = { path, name ->
@@ -154,10 +167,8 @@ fun ThreadScreen(
                         onCompose()
                     }
                 )
-                HorizontalDivider(
-                    modifier = Modifier.padding(top = 8.dp, bottom = 24.dp),
-                    color = HmailTheme.colors.outline
-                )
+                // 分隔线换成留白：底部回复区自带底色，再画线会显得割裂。
+                Spacer(Modifier.height(32.dp))
             }
         }
     }
@@ -184,35 +195,55 @@ fun ThreadScreen(
 private fun ThreadMessage(
     model: MailModel,
     mail: Mail,
-    starred: Boolean,
     aid: String,
     context: Context,
     onDownloadAttachment: (String, String) -> Unit,
     onComposeMode: (String) -> Unit
 ) {
-    var detailsVisible by remember { mutableStateOf(false) }
+    val starred = "STARRED" in mail.labels
+    // 单页会连着显示同一会话的多封邮件，星标属于各自那封：放在发件人标题行右侧。
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = mail.from,
+            modifier = Modifier.weight(1f),
+            // 发件人较长时换行显示，不再截断；星标随整行文字垂直居中。
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground
+        )
+        IconButton(
+            onClick = {
+                model.work {
+                    model.modify(
+                        add = if (starred) emptyList() else listOf("STARRED"),
+                        remove = if (starred) listOf("STARRED") else emptyList(),
+                        ids = listOf(mail.id)
+                    )
+                }
+            },
+            modifier = Modifier.size(48.dp)
+        ) {
+            MailIcon(
+                "star",
+                contentDescription = if (starred) "取消星标" else "添加星标",
+                tint = if (starred) HmailTheme.colors.star else HmailTheme.colors.muted
+            )
+        }
+    }
 
-    SectionText(mail.from, size = 16f, bold = true)
+    // 收件详情不再折叠：发件人下方直接给出收件人/抄送/时间。
     val details = buildString {
         append("收件人：").append(mail.raw.str("to")).append('\n')
         if (mail.raw.str("cc").isNotBlank()) append("抄送：").append(mail.raw.str("cc")).append('\n')
         append(mail.raw.str("date"))
     }
-    SecondaryAction("收件详情") { detailsVisible = !detailsVisible }
-    if (detailsVisible) {
-        Spacer(Modifier.height(8.dp))
-        SelectionContainer { SectionText(details, size = 12f, muted = true) }
-    }
-    SecondaryAction(if (starred) "取消星标" else "添加星标") {
-        model.work {
-            model.modify(
-                add = if (starred) emptyList() else listOf("STARRED"),
-                remove = if (starred) listOf("STARRED") else emptyList(),
-                ids = listOf(mail.id)
-            )
-        }
-    }
+    SelectionContainer { SectionText(details, size = 12f, muted = true) }
 
+    // 标题与收发信息整体与正文之间留出更大的间距。
+    Spacer(Modifier.height(12.dp))
     if (mail.raw.str("html").isNotBlank()) {
         HtmlMessage(html = mail.raw.str("html"), aid = aid, context = context, model = model)
     } else {
@@ -229,9 +260,36 @@ private fun ThreadMessage(
         Spacer(Modifier.height(8.dp))
     }
 
-    listOf("回复" to "reply", "回复全部" to "replyAll", "转发" to "forward").forEach { (label, mode) ->
-        SecondaryAction(label) { onComposeMode(mode) }
-        Spacer(Modifier.height(8.dp))
+    Spacer(Modifier.height(20.dp))
+    ReplyRow(onComposeMode)
+}
+
+/** 回复 / 回复全部 / 转发合并成一行，底色与顶部栏呼出的操作卡片一致。 */
+private val ReplyModes = listOf("回复" to "reply", "回复全部" to "replyAll", "转发" to "forward")
+
+@Composable
+private fun ReplyRow(onComposeMode: (String) -> Unit) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        color = HmailTheme.card,
+        contentColor = HmailTheme.colors.onSelected
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            ReplyModes.forEach { (label, mode) ->
+                TextButton(
+                    onClick = { onComposeMode(mode) },
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 4.dp),
+                    colors = ButtonDefaults.textButtonColors(contentColor = HmailTheme.colors.onSelected)
+                ) {
+                    Text(label, maxLines = 1, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
     }
 }
 
@@ -249,7 +307,11 @@ private fun HtmlMessage(html: String, aid: String, context: Context, model: Mail
     val height = if (heightPx > 0) with(density) { heightPx.toDp() } else 420.dp
 
     AndroidView(
-        modifier = Modifier.fillMaxWidth().height(height),
+        // WebView 自身是直角，靠外层裁剪收成与卡片一致的圆角。
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(height)
+            .clip(RoundedCornerShape(16.dp)),
         factory = { ctx ->
             WebView(ctx).apply {
                 settings.apply {
