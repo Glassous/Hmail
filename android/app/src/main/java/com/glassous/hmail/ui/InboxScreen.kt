@@ -434,12 +434,16 @@ fun InboxScreen(
             verticalArrangement = Arrangement.spacedBy(BlockGap)
         ) {
             // 有未完成草稿时，在"写邮件"上方再加一块玻璃入口。
+            // 与"写邮件"同色同玻璃质感，但内容固定不随滚动开合。
             if (model.hasDraft) {
                 GlassPill(
                     backdrop = backdrop,
                     modifier = Modifier.height(FabHeight),
+                    tint = HmailTheme.card,
                     onClick = onCompose
                 ) {
+                    MailIcon("draft_file", tint = MaterialTheme.colorScheme.onBackground)
+                    Spacer(Modifier.width(8.dp))
                     Text(
                         "继续写信",
                         style = MaterialTheme.typography.titleMedium,
