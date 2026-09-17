@@ -2,6 +2,7 @@
 import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import { gsap, Flip, motionDuration } from './motion'
+import { providerIcon } from './providers'
 
 const props = defineProps<{ accounts: { id: string; email: string }[]; modelValue: string; hidden?: boolean }>()
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
@@ -67,7 +68,7 @@ onUnmounted(() => { revision++; animation?.kill(); context?.revert(); document.r
       </button>
       <div id="mailbox-options" class="mailbox-options" :role="opened ? 'listbox' : undefined" aria-label="选择邮箱">
         <button v-for="account in accounts" v-show="opened || account.id === modelValue" :key="account.id" type="button" :data-flip-id="'mailbox-' + account.id" :data-account="account.id" class="mailbox-option" :class="{ 'is-selected': opened && account.id === modelValue }" :role="opened ? 'option' : undefined" :aria-selected="opened ? account.id === modelValue : undefined" :tabindex="opened ? (highlighted === account.id ? 0 : -1) : 0" v-tip="account.email" :aria-label="opened ? account.email : '切换邮箱：' + account.email" @click="opened ? change(false, account.id, true) : change(true)">
-          <span class="mailbox-avatar">{{ account.email[0]?.toUpperCase() }}</span><span class="min-w-0 flex-1 truncate">{{ account.email }}</span><Icon v-if="opened && account.id === modelValue" name="check" :size="14" class="shrink-0"/>
+          <img v-if="providerIcon(account.email)" :src="providerIcon(account.email)" alt="" aria-hidden="true" class="mailbox-logo"/><span class="min-w-0 flex-1 truncate">{{ account.email }}</span><Icon v-if="opened && account.id === modelValue" name="check" :size="14" class="shrink-0"/>
         </button>
         <p v-if="!accounts.length" class="px-3 pb-3 text-xs text-slate-400">尚未连接邮箱</p>
       </div>
