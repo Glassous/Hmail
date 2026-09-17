@@ -105,6 +105,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
     private var labelsJob: Job? = null
     private var syncJob: Job? = null
     private var threadJob: Job? = null
+    private var verifyJob: Job? = null
     private var mailboxGeneration = 0
     private var accountGeneration = 0
     private var labelsGeneration = 0
@@ -137,8 +138,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         folder = saved.str("folder").ifBlank { "INBOX" }
         query = saved.str("query")
         theme = vault.read("theme") ?: savedUser.str("theme").ifBlank { "system" }
-        compose = vault.read("draft:$owner")?.let { runCatching { ComposeState.restore(it) }.getOrNull() }
-            ?.takeIf { it.owner == owner }
+        restoreStoredCompose(owner)
         if (aid.isNotBlank()) {
             listCache.read(MailListKey(owner, aid, folder, query))?.let {
                 items = it.items; next = it.next; loadedPages = it.pages
@@ -169,9 +169,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         }
         user = remoteUser; api.csrf = result.str("csrf"); sessionReady = true
         vault.write("local-mailbox-owner", remoteUser.str("id"))
-        if (compose == null) compose = vault.read("draft:${remoteUser.str("id")}")
-            ?.let { runCatching { ComposeState.restore(it) }.getOrNull() }
-            ?.takeIf { it.owner == remoteUser.str("id") }
+        if (compose == null) restoreStoredCompose(remoteUser.str("id"))
         theme = remoteUser.str("theme").ifBlank { "system" }
         persistMailboxContext(); changed()
     }
@@ -214,7 +212,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         user = incoming; api.csrf = result.str("csrf"); authGeneration++; sessionReady = true; localOnly = false
         vault.write("local-mailbox-owner", incoming.str("id"))
         theme = user!!.str("theme").ifBlank { "system" }; vault.write("theme", theme)
-        compose = vault.read("draft:${user!!.str("id")}")?.let { runCatching { ComposeState.restore(it) }.getOrNull() }
+        restoreStoredCompose(user!!.str("id"))
         if (compose?.owner != user!!.str("id")) compose = null
         persistMailboxContext(); changed()
         refreshAccounts(sync); initialized = true; changed()
@@ -227,7 +225,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         if (owner != null) cacheWrites.trySend { listCache.retainAccounts(owner, emptySet()) }
         persistCompose(); authGeneration++; listGeneration++; listJob?.cancel(); autosave?.cancel()
         mailboxGeneration++; accountGeneration++; labelsGeneration++; threadGeneration++
-        labelsJob?.cancel(); syncJob?.cancel(); threadJob?.cancel()
+        labelsJob?.cancel(); syncJob?.cancel(); threadJob?.cancel(); verifyJob?.cancel()
         if (clearAuthentication) api.clear()
         user = null; compose = null; mailbox = MailboxState(); syncing = false; loading = false; listError = null
         resetPages(); messages = emptyList(); forms.clear(); initialized = true; starting = false; changed()
@@ -503,6 +501,12 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         if (!hasDraft) return // 没编辑过就不写本地草稿：避免留下空草稿与多余的继续编辑入口。
         vault.write("draft:${state.owner}", state.stored())
     }
+    /** 从本地恢复未完成的写信；若上次发送结果未确认（如进程被杀），立即启动自动核对。 */
+    private fun restoreStoredCompose(owner: String) {
+        compose = vault.read("draft:$owner")?.let { runCatching { ComposeState.restore(it) }.getOrNull() }
+            ?.takeIf { it.owner == owner }
+        compose?.takeIf { it.uncertain }?.let { verifyPendingSend(it) }
+    }
     fun startCompose(mode: String = "", mail: Mail? = null) {
         if (compose != null) return
         val owner = user?.str("id") ?: return
@@ -601,12 +605,65 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         state.uncertain = true; persistCompose(); changed()
         try {
             api.json(path("/send", state.account), "POST", state.payload)
-            vault.write("draft:${state.owner}", null); compose = null
-            if (folder == "DRAFT") loadList() // 仅草稿箱需要立即移除已发送的草稿。
+            finishSend(state)
         } catch (e: Exception) {
-            state.uncertain = e !is ApiFailure || e.code == "send_uncertain" || e.status >= 500
-            persistCompose(); throw e
+            // 只有「确定未投递」的失败才解除锁定；其余保持待确认，交给自动核对收敛。
+            state.uncertain = when {
+                e !is ApiFailure -> true
+                e.code == "send_failed" || e.code == "network" -> false
+                e.code == "send_uncertain" -> true
+                else -> e.status >= 500
+            }
+            persistCompose()
+            if (state.uncertain) verifyPendingSend(state)
+            throw e
         } finally { composeBusy = false; changed() }
+    }
+    /** 发送成功（含核对确认）后的统一收尾：清本地草稿、刷新全部邮箱与当前列表。收尾失败不得改变「已发送」。 */
+    private fun finishSend(state: ComposeState) {
+        state.uncertain = false
+        if (compose === state) {
+            compose = null; savedText = ""
+            try { vault.write("draft:${state.owner}", null) } catch (_: Exception) { }
+        }
+        refreshAll()
+        loadList(sync = true)
+        changed()
+    }
+    /** 刷新全部邮箱：服务端会把该账户下所有已连接邮箱的所有文件夹重新同步（邮箱服务器 + 数据库索引）。 */
+    fun refreshAll() {
+        viewModelScope.launch {
+            try { api.json("/sync-all", "POST") }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { fail(e) }
+        }
+    }
+    /**
+     * 发送结果不明确（响应丢失/连接中断）时自动与服务端核对。
+     * 服务端会在「已发送」文件夹确认该邮件是否真的发出：
+     * 确认已发出则按成功收尾；确认从未发出则解除锁定，允许重新编辑发送。
+     */
+    private fun verifyPendingSend(state: ComposeState) {
+        verifyJob?.cancel()
+        val aid = state.account
+        val composeId = state.payload.str("composeId")
+        if (composeId.isBlank() || user == null) return
+        verifyJob = viewModelScope.launch {
+            repeat(6) { attempt ->
+                if (compose !== state || !state.uncertain) return@launch
+                delay(if (attempt == 0) 1500 else 4000)
+                if (compose !== state || !state.uncertain) return@launch
+                val result = try { api.json(path("/send-status?composeId=${enc(composeId)}", aid)) }
+                    catch (e: CancellationException) { throw e }
+                    catch (e: Exception) { if (e is ApiFailure && e.code in listOf("unauthorized", "csrf")) fail(e); null }
+                    ?: return@repeat
+                when (result.str("status")) {
+                    "sent" -> { finishSend(state); return@launch }
+                    // 服务端没有该会话或已作废：确认从未投递，解除锁定让用户重新发送。
+                    "none", "discarded" -> { state.uncertain = false; persistCompose(); changed(); return@launch }
+                }
+            }
+        }
     }
     suspend fun discard() = draftMutex.withLock {
         autosave?.cancel(); val state = compose ?: return@withLock

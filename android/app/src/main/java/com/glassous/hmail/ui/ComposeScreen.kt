@@ -174,7 +174,7 @@ fun ComposeScreen(
 
         if (state.uncertain) {
             Text(
-                text = "发送结果待确认，请先查看已发送。",
+                text = "发送结果待确认，正在自动核对…请勿重复发送；也可稍后在“已发送”中确认。",
                 modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
                 color = MaterialTheme.colorScheme.error,
                 fontSize = 14.sp
