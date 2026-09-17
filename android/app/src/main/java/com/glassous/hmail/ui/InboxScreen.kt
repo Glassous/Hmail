@@ -14,6 +14,7 @@ import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -55,6 +56,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -64,6 +66,7 @@ import com.glassous.hmail.Mail
 import com.glassous.hmail.MailIcon
 import com.glassous.hmail.MailModel
 import com.glassous.hmail.folders
+import com.glassous.hmail.providerIcon
 import com.glassous.hmail.shortDate
 import com.glassous.hmail.str
 import com.glassous.hmail.ui.common.GlassAction
@@ -344,9 +347,9 @@ fun InboxScreen(
                             subject = mail.subject,
                             snippet = mail.raw.str("snippet"),
                             date = shortDate(mail.raw.str("date")),
-                            // 统一视图里在主标题下方补一行小字，标明这封邮件来自哪个邮箱。
-                            accountLabel = if (model.allAccounts) {
-                                mail.account.ifBlank { model.accounts.find { it.id == mail.accountId }?.email.orEmpty() }.let { if (it.isBlank()) "" else "$it 的邮件" }
+                            // 统一视图里在主标题下方补一行小字，标明这封邮件来自哪个邮箱；行内图标由 MailRow 解析。
+                            accountEmail = if (model.allAccounts) {
+                                mail.account.ifBlank { model.accounts.find { it.id == mail.accountId }?.email.orEmpty() }
                             } else "",
                             onToggle = {
                                 val identity = model.threadIdentity(mail)
@@ -551,7 +554,7 @@ private fun MailRow(
     subject: String,
     snippet: String,
     date: String,
-    accountLabel: String,
+    accountEmail: String,
     onToggle: () -> Unit,
     onOpen: () -> Unit
 ) {
@@ -583,15 +586,25 @@ private fun MailRow(
                 )
                 Text(date, fontSize = 11.sp, color = colors.muted)
             }
-            // 统一视图专属：主标题下方一行账户小字，与主标题左对齐。
-            if (accountLabel.isNotBlank()) {
-                Text(
-                    text = accountLabel,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    fontSize = 13.sp,
-                    color = colors.muted
-                )
+            // 统一视图专属：主标题下方一行账户小字，带服务商图标；未适配的服务商只显示文字，与主标题左对齐。
+            if (accountEmail.isNotBlank()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    providerIcon(accountEmail)?.let { logo ->
+                        Image(
+                            painter = painterResource(logo),
+                            contentDescription = null,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                    }
+                    Text(
+                        text = "$accountEmail 的邮件",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        fontSize = 13.sp,
+                        color = colors.muted
+                    )
+                }
             }
             Text(
                 text = subject,

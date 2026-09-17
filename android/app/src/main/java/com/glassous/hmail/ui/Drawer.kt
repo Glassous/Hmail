@@ -1,6 +1,7 @@
 package com.glassous.hmail.ui
 
 import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -32,6 +33,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -41,6 +43,7 @@ import com.glassous.hmail.MailIcon
 import com.glassous.hmail.MailModel
 import com.glassous.hmail.MailboxState
 import com.glassous.hmail.folders
+import com.glassous.hmail.providerIcon
 import com.glassous.hmail.ui.common.SecondaryAction
 import com.glassous.hmail.ui.theme.Brand
 import com.glassous.hmail.ui.theme.HmailTheme
@@ -217,6 +220,8 @@ private data class AccountOption(val id: String, val label: String)
 
 @Composable
 private fun AccountOptionRow(label: String, highlighted: Boolean, interaction: MutableInteractionSource, onClick: () -> Unit) {
+    // 「全部账户」与未适配的服务商没有图标，此时邮箱文字直接居左，与 Web 端一致。
+    val logo = providerIcon(label)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -227,6 +232,14 @@ private fun AccountOptionRow(label: String, highlighted: Boolean, interaction: M
             .padding(horizontal = 14.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        if (logo != null) {
+            Image(
+                painter = painterResource(logo),
+                contentDescription = null,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(Modifier.width(7.dp))
+        }
         Text(
             text = label,
             modifier = Modifier.weight(1f),
