@@ -57,6 +57,8 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
     val accounts get() = mailbox.accounts
     val labels get() = mailbox.labels
     val active get() = mailbox.active
+    /** 是否处于「全部账户」统一视图（跨邮箱合并列表）。 */
+    val allAccounts get() = active == ALL_ACCOUNTS
     var syncing by mutableStateOf(false)
         private set
     var listError by mutableStateOf<String?>(null)
@@ -106,6 +108,11 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
     private var syncJob: Job? = null
     private var threadJob: Job? = null
     private var verifyJob: Job? = null
+    /** 当前会话详情所属邮箱：统一视图下它与 active 不同，会话内的写操作必须用它。 */
+    private var threadOwner = ""
+    /** 需要重新连接的邮箱：统一视图下可能是任意一个，用于列表顶部的失效提示。 */
+    val reconnectAccount get() = if (allAccounts) accounts.firstOrNull { it.status == "reconnect" }
+        else accounts.find { it.id == active }?.takeIf { it.status == "reconnect" }
     private var mailboxGeneration = 0
     private var accountGeneration = 0
     private var labelsGeneration = 0
@@ -114,6 +121,10 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
     private var authGeneration = 0
     fun changed() { revision.value++ }
     fun path(suffix: String, aid: String = active) = "/gmail-accounts/${enc(aid)}$suffix"
+    /** 邮件所属邮箱：统一视图列表项自带 accountId，会话内的邮件回退到当前会话所属邮箱。 */
+    fun mailAccount(mail: Mail) = mail.accountId.ifBlank { if (allAccounts) threadOwner.ifBlank { active } else active }
+    /** 跨账户的 id/threadId 可能重复，选中集合与列表 key 统一使用「邮箱 + 线程」复合身份。 */
+    fun threadIdentity(mail: Mail) = "${mailAccount(mail)}:${mail.threadId}"
     fun form(name: String) = forms.getOrPut(name) { mutableMapOf() }
     fun fail(error: Throwable) {
         if (error is CancellationException) return
@@ -128,15 +139,18 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         val owner = savedUser.str("id")
         if (owner.isBlank() || vault.read("local-mailbox-owner") != owner) return
         val savedAccounts = saved.array("accounts").objects().map(Account::from)
-        // 冷启动优先落在默认邮箱上；没有默认邮箱时才沿用上次选择的邮箱。
-        val aid = savedAccounts.firstOrNull { it.isDefault }?.id
-            ?: saved.str("active").takeIf { value -> savedAccounts.any { it.id == value } }
+        val savedActive = saved.str("active")
+        // 冷启动优先落在默认邮箱上；上次停留在「全部账户」且仍有两个以上邮箱时沿用统一视图。
+        val aid = if (savedActive == ALL_ACCOUNTS && savedAccounts.size >= 2) ALL_ACCOUNTS
+        else savedAccounts.firstOrNull { it.isDefault }?.id
+            ?: savedActive.takeIf { value -> savedAccounts.any { it.id == value } }
             ?: savedAccounts.firstOrNull()?.id.orEmpty()
         user = savedUser
         mailbox = MailboxState(accounts = savedAccounts, active = aid,
             labels = saved.array("labels").objects().map(MailLabel::from))
         folder = saved.str("folder").ifBlank { "INBOX" }
-        query = saved.str("query")
+        // 统一视图没有跨账户搜索，恢复时清掉可能残留的搜索词。
+        query = if (aid == ALL_ACCOUNTS) "" else saved.str("query")
         theme = vault.read("theme") ?: savedUser.str("theme").ifBlank { "system" }
         restoreStoredCompose(owner)
         if (aid.isNotBlank()) {
@@ -240,8 +254,12 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
             if (auth != authGeneration || generation != accountGeneration) return
             mailbox = mailbox.copy(accounts = result, accountsLoading = false)
             val owner = user?.str("id").orEmpty()
-            cacheWrites.trySend { listCache.retainAccounts(owner, result.map { it.id }.toSet()) }
-            if (result.none { it.id == active }) {
+            // 统一视图的本地缓存挂在哨兵账户下，清理时必须保留。
+            cacheWrites.trySend { listCache.retainAccounts(owner, result.map { it.id }.toSet() + ALL_ACCOUNTS) }
+            if (allAccounts && result.size < 2) {
+                // 只剩一个邮箱时统一视图没有意义，回到默认邮箱。
+                switchAccount(result.firstOrNull { it.isDefault }?.id ?: result.firstOrNull()?.id ?: "", sync)
+            } else if (!allAccounts && result.none { it.id == active }) {
                 // 当前邮箱已不存在时落到默认邮箱；没有默认邮箱则用列表里最早连接的邮箱。
                 switchAccount(result.firstOrNull { it.isDefault }?.id ?: result.firstOrNull()?.id ?: "", sync)
             } else {
@@ -273,6 +291,11 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
     }
     fun refreshLabels(expectedAccount: String = active) {
         if (expectedAccount != active) return
+        // 统一视图没有单一账户的标签体系，保持空标签并跳过请求。
+        if (expectedAccount == ALL_ACCOUNTS) {
+            mailbox = mailbox.copy(labels = emptyList(), labelsLoading = false, labelsError = null)
+            return
+        }
         labelsJob?.cancel()
         val generation = ++labelsGeneration
         val auth = authGeneration
@@ -304,7 +327,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         mailboxGeneration++; listGeneration++; labelsGeneration++; threadGeneration++
         syncing = false
         mailbox = mailbox.copy(active = id, labels = emptyList(), labelsLoading = false, labelsError = null)
-        folder = "INBOX"; query = ""; messages = emptyList(); resetPages()
+        folder = "INBOX"; query = ""; messages = emptyList(); threadOwner = ""; resetPages()
         persistMailboxContext()
         loadList(sync = sync, initial = true)
         refreshLabels()
@@ -313,8 +336,8 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         loadedPages = 0; paginationReady = false; next = ""; items = emptyList(); selected.clear()
         loadingMore = false; moreError = null; listPosition = 0; listOffset = 0
     }
-    fun chooseFolder(id: String) { syncJob?.cancel();syncing=false; mailboxGeneration++; folder = id; query = ""; resetPages(); persistMailboxContext(); loadList(sync=true,initial=true) }
-    fun search(value: String) { query = value.trim(); resetPages(); persistMailboxContext(); loadList() }
+    fun chooseFolder(id: String) { syncJob?.cancel();syncing=false; mailboxGeneration++; folder = id; query = ""; threadOwner = ""; resetPages(); persistMailboxContext(); loadList(sync=true,initial=true) }
+    fun search(value: String) { if (allAccounts) return; query = value.trim(); resetPages(); persistMailboxContext(); loadList() }
     fun loadMore() {
         if (!canLoadMore) return
         loadList(append = true)
@@ -327,6 +350,8 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         val rows = items.map { mail ->
             obj("id" to mail.id, "threadId" to mail.threadId, "subject" to mail.raw.str("subject"),
                 "from" to mail.from, "date" to mail.raw.str("date"), "snippet" to mail.raw.str("snippet"),
+                // 统一视图的缓存必须带上所属邮箱，冷启动才能继续显示账户副标题。
+                "accountId" to mailAccount(mail), "account" to mail.account,
                 "labels" to JSONArray(mail.labels), "count" to mail.raw.optInt("count", 1))
         }
         val cursor = next
@@ -363,23 +388,28 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
                 val baseline = items.toList()
                 var cursor = if (append) next else ""
                 var restarted = false
+                val all = allAccounts
+                fun unifiedUrl(useCursor: Boolean) = "/threads?folder=${enc(chosenFolder)}" + if (useCursor) "&cursor=${enc(cursor)}" else ""
                 val result = try {
-                    api.json(path("/threads?folder=${enc(chosenFolder)}&q=${enc(chosenQuery)}&cursor=${enc(cursor)}", aid))
+                    if (all) api.json(unifiedUrl(true))
+                    else api.json(path("/threads?folder=${enc(chosenFolder)}&q=${enc(chosenQuery)}&cursor=${enc(cursor)}", aid))
                 } catch (e: ApiFailure) {
                     if (e.code != "cursor_expired") throw e
                     restarted = true
-                    api.json(path("/threads?folder=${enc(chosenFolder)}&q=${enc(chosenQuery)}", aid))
+                    if (all) api.json(unifiedUrl(false))
+                    else api.json(path("/threads?folder=${enc(chosenFolder)}&q=${enc(chosenQuery)}", aid))
                 }
                 if (!current()) return@launch
                 val rows = withContext(Dispatchers.Default) { result.array("items").objects().map(::Mail) }
                 cursor = result.str("nextCursor")
                 if (current()) {
-                    val unique = rows.distinctBy { it.threadId }.map { row ->
-                        if ("$aid:${row.id}" in pendingMail || "$aid:${row.threadId}" in pendingMail) baseline.find { it.id == row.id } ?: row else row
+                    val unique = rows.distinctBy { threadIdentity(it) }.map { row ->
+                        val owner = mailAccount(row)
+                        if ("$owner:${row.id}" in pendingMail || "$owner:${row.threadId}" in pendingMail) baseline.find { it.id == row.id } ?: row else row
                     }
                     items = if (append && !restarted) {
-                        val existing = baseline.map { it.threadId }.toSet()
-                        baseline + unique.filter { it.threadId !in existing }
+                        val existing = baseline.map { threadIdentity(it) }.toSet()
+                        baseline + unique.filter { threadIdentity(it) !in existing }
                     } else unique
                     next = cursor
                     loadedPages = if (append && !restarted) loadedPages + 1 else 1
@@ -388,7 +418,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
                         historyComplete = state.optBoolean("historyComplete")
                     }
                     paginationReady = true; localOnly = false
-                    selected.retainAll(items.map { it.threadId }.toSet())
+                    selected.retainAll(items.map { threadIdentity(it) }.toSet())
                     cacheCurrentList()
                     changed()
                 }
@@ -416,12 +446,16 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         val mailboxVersion = mailboxGeneration
         val chosenFolder = folder
         syncing = true; changed()
+        val all = allAccounts
         syncJob = viewModelScope.launch {
             try {
                 ensureSession()
-                api.json(path("/sync-jobs?folder=${enc(chosenFolder)}", aid), "POST")
+                // 统一视图刷新全部邮箱，并轮询聚合状态；单账户沿用原岗位接口。
+                if (all) api.json("/sync-all", "POST")
+                else api.json(path("/sync-jobs?folder=${enc(chosenFolder)}", aid), "POST")
                 while (isActive && auth == authGeneration && aid == active && mailboxVersion == mailboxGeneration && chosenFolder == folder) {
-                    val result = api.json(path("/sync-status?folder=${enc(chosenFolder)}", aid))
+                    val result = if (all) api.json("/threads/sync-status?folder=${enc(chosenFolder)}")
+                    else api.json(path("/sync-status?folder=${enc(chosenFolder)}", aid))
                     if (auth != authGeneration || aid != active || mailboxVersion != mailboxGeneration || chosenFolder != folder) break
                     historyComplete = result.optBoolean("historyComplete")
                     if (result.optLong("indexVersion") != indexVersion) { loadList(quiet = true); refreshLabels() }
@@ -444,45 +478,48 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         threadJob = currentCoroutineContext()[Job]
         val requestGeneration = ++threadGeneration
         val generation = authGeneration
+        threadOwner = aid
         val result = api.list(path("/threads/${enc(tid)}", aid)).map(::Mail)
-        if (generation != authGeneration || aid != active || requestGeneration != threadGeneration) return@coroutineScope
+        if (generation != authGeneration || threadOwner != aid || requestGeneration != threadGeneration) return@coroutineScope
         messages = result; changed()
         val unread = result.filter { "UNREAD" in it.labels }.map { it.id }
         if (unread.isNotEmpty()) {
             viewModelScope.launch {
-                if (generation == authGeneration && aid == active) {
-                    try { modify(remove=listOf("UNREAD"), ids=unread, threads=emptyList()) }
-                    catch(e: Exception) { fail(e) }
+                if (generation == authGeneration && threadOwner == aid) {
+                    try { modify(remove = listOf("UNREAD"), ids = unread, threads = emptyList(), account = aid) }
+                    catch (e: Exception) { fail(e) }
                 }
             }
         }
     }
-    suspend fun modify(add: List<String> = emptyList(), remove: List<String> = emptyList(), action: String = "labels", ids: List<String> = emptyList(), threads: List<String> = selected.toList()) {
+    /** 单账户写入：[ids]/[threads] 都属于 [account]；统一视图的列表操作请用 [modifySelected]。 */
+    suspend fun modify(add: List<String> = emptyList(), remove: List<String> = emptyList(), action: String = "labels", ids: List<String> = emptyList(), threads: List<String> = emptyList(), account: String = active) {
         if (ids.isEmpty() && threads.isEmpty()) return
-        val aid = active
+        val aid = account
         val auth = authGeneration
         val mailboxVersion = mailboxGeneration
+        val owned = { mail: Mail -> mailAccount(mail) == aid }
         val keys = (if (ids.isEmpty()) threads else ids).map { "$aid:$it" }
         if (keys.any { it in pendingMail }) return
         pendingMail.addAll(keys)
-        val snapshots = (items + messages).filter { it.id in ids || it.threadId in threads }.associateWith { it.labels.toList() }
+        val snapshots = (items + messages).filter { owned(it) && (it.id in ids || it.threadId in threads) }.associateWith { it.labels.toList() }
         snapshots.forEach { (mail, before) -> mail.raw.put("labels", JSONArray((before - remove.toSet() + add).distinct())) }
         changed()
         val result = try {
             api.json(path("/messages/modify", aid), "POST", obj("ids" to JSONArray(ids), "threadIds" to JSONArray(if (ids.isEmpty()) threads else emptyList<String>()), "add" to JSONArray(add), "remove" to JSONArray(remove), "action" to action))
         } catch (e: Exception) {
-            if (aid == active && auth == authGeneration) snapshots.forEach { (mail, before) -> mail.raw.put("labels", JSONArray(before)) }
+            snapshots.forEach { (mail, before) -> mail.raw.put("labels", JSONArray(before)) }
             throw e
         } finally { pendingMail.removeAll(keys.toSet()); changed() }
-        if (aid != active || auth != authGeneration || mailboxVersion != mailboxGeneration) return
+        if (auth != authGeneration || mailboxVersion != mailboxGeneration) return
         val failed = result.array("results").objects().filter { !it.optBoolean("ok") }.map { it.str("id") }.toSet()
         snapshots.filter { (mail, _) -> mail.id in failed || mail.threadId in failed }.forEach { (mail, before) -> mail.raw.put("labels", JSONArray(before)) }
         if (failed.isNotEmpty()) { cacheCurrentList(); changed(); throw java.io.IOException("部分邮件未能更新，请重试失败项") }
-        messages.filter { ids.contains(it.id) || threads.contains(it.threadId) }.forEach { it.raw.put("labels", JSONArray((it.labels - remove.toSet() + add).distinct())) }
+        messages.filter { owned(it) && (ids.contains(it.id) || threads.contains(it.threadId)) }.forEach { it.raw.put("labels", JSONArray((it.labels - remove.toSet() + add).distinct())) }
         // A confirmed write updates the local view before reconciliation; never delete the
         // entire local mailbox merely because a refresh could follow this operation.
         items = items.mapNotNull { mail ->
-            if (mail.id !in ids && mail.threadId !in threads) return@mapNotNull mail
+            if (!owned(mail) || (mail.id !in ids && mail.threadId !in threads)) return@mapNotNull mail
             val updatedLabels = (mail.labels - remove.toSet() + add).distinct()
             val leavesFolder = when {
                 action == "trash" -> folder != "TRASH"
@@ -496,6 +533,20 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         selected.clear(); cacheCurrentList(); changed()
         // Reconciliation is driven by the mailbox index version, not a blocking reload.
     }
+    /** 统一视图的列表操作：按邮件所属邮箱分组，各自提交后合并失败项，避免跨账户误写。 */
+    suspend fun modifySelected(add: List<String> = emptyList(), remove: List<String> = emptyList(), action: String = "labels") {
+        val picked = items.filter { threadIdentity(it) in selected }
+        if (picked.isEmpty()) return
+        var failure: Exception? = null
+        for ((aid, mails) in picked.groupBy { mailAccount(it) }) {
+            try { modify(add, remove, action, ids = emptyList(), threads = mails.map { it.threadId }, account = aid) }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { if (failure == null) failure = e }
+        }
+        if (failure == null) selected.clear()
+        changed()
+        failure?.let { throw it }
+    }
     fun persistCompose() {
         val state = compose ?: return
         if (!hasDraft) return // 没编辑过就不写本地草稿：避免留下空草稿与多余的继续编辑入口。
@@ -507,11 +558,14 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
             ?.takeIf { it.owner == owner }
         compose?.takeIf { it.uncertain }?.let { verifyPendingSend(it) }
     }
-    fun startCompose(mode: String = "", mail: Mail? = null) {
+    fun startCompose(mode: String = "", mail: Mail? = null, account: String = "") {
         if (compose != null) return
         val owner = user?.str("id") ?: return
-        if (active.isBlank()) return
-        val state = ComposeState(owner, active)
+        val fallback = if (allAccounts) accounts.firstOrNull { it.isDefault }?.id ?: accounts.firstOrNull()?.id.orEmpty() else active
+        // 统一视图没有单一发件账户：显式指定 > 回复邮件的所属邮箱/会话邮箱 > 默认邮箱。
+        val target = account.ifBlank { mail?.accountId?.takeIf { it.isNotBlank() } ?: (if (allAccounts) threadOwner else active).ifBlank { fallback } }
+        if (target.isBlank()) return
+        val state = ComposeState(owner, target)
         if (mail != null) {
             val p = state.payload; val m = mail.raw
             p.put("subject", if (Regex("^(re|fwd):", RegexOption.IGNORE_CASE).containsMatchIn(mail.subject)) mail.subject else (if (mode == "forward") "Fwd: " else "Re: ") + mail.subject)
@@ -519,7 +573,7 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
             if (mode != "forward") {
                 p.put("to", address(mail.from)); p.put("inReplyTo", m.str("messageId")); p.put("references", (m.str("references") + " " + m.str("messageId")).trim()); p.put("threadId", mail.threadId)
                 if (mode == "replyAll") {
-                    val own = accounts.find { it.id == active }?.email.orEmpty()
+                    val own = accounts.find { it.id == target }?.email.orEmpty()
                     p.put("cc", (m.str("to") + "," + m.str("cc")).split(',').map(::address).filter { it.isNotBlank() && !it.equals(own, true) && !it.equals(p.str("to"), true) }.distinctBy { it.lowercase() }.joinToString(", "))
                 }
             } else state.attachments = mail.attachments.map { it.copy(messageId = mail.id) }
@@ -534,7 +588,11 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         threadJob = currentCoroutineContext()[Job]
         val generation = ++threadGeneration
         val auth = authGeneration
-        val aid = active
+        val mailboxVersion = mailboxGeneration
+        // 统一视图里草稿可能属于任一邮箱，优先用列表项自带的账户。
+        val aid = mail.accountId.takeIf { it.isNotBlank() }
+            ?: (if (allAccounts) accounts.firstOrNull { it.isDefault }?.id ?: accounts.firstOrNull()?.id.orEmpty() else active)
+        if (aid.isBlank()) return@coroutineScope
         val direct = mail.raw.str("draftId")
         val drafts = if (direct.isNotBlank()) listOf(obj("id" to direct, "messageId" to mail.id)) else api.list(path("/drafts", aid))
         var found = drafts.find { it.str("messageId") == mail.id || it.str("id") == mail.id }
@@ -543,8 +601,8 @@ class MailModel private constructor(app: Application) : AndroidViewModel(app) {
         }
         val id = found?.str("id") ?: throw ApiFailure("not_found", 404, "草稿未找到，请刷新后重试")
         val message = Mail(api.json(path("/drafts/${enc(id)}", aid)))
-        if (auth != authGeneration || aid != active || generation != threadGeneration) return@coroutineScope
-        startCompose()
+        if (auth != authGeneration || mailboxVersion != mailboxGeneration || generation != threadGeneration) return@coroutineScope
+        startCompose(account = aid)
         compose!!.apply {
             listOf("to", "cc", "bcc", "subject", "text", "references", "threadId").forEach { payload.put(it, message.raw.str(it)) }
             payload.put("draftId", id)

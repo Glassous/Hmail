@@ -140,6 +140,9 @@ data class Attachment(val id: String, val name: String, val size: Long, val mess
 data class Mail(val raw: JSONObject) {
     val id get() = raw.str("id")
     val threadId get() = raw.str("threadId")
+    /** 统一视图才会下发这两个字段；单账户列表为空串，由调用方回退到当前账户。 */
+    val accountId get() = raw.str("accountId")
+    val account get() = raw.str("account")
     val subject get() = raw.str("subject").ifBlank { "（无主题）" }
     val from get() = raw.str("from")
     val labels get() = (0 until raw.array("labels").length()).map { raw.array("labels").getString(it) }

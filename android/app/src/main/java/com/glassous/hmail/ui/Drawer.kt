@@ -33,6 +33,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.glassous.hmail.ALL_ACCOUNTS
 import com.glassous.hmail.MailIcon
 import com.glassous.hmail.MailModel
 import com.glassous.hmail.MailboxState
@@ -83,26 +84,31 @@ fun DrawerContent(
                     model.chooseFolder(key)
                 }
             }
-            if (model.mailbox.labelsLoading) {
-                Text("正在加载标签", Modifier.padding(horizontal = 24.dp, vertical = 8.dp), color = HmailTheme.colors.muted)
-            }
-            model.mailbox.labelsError?.let { error ->
-                Text(error, Modifier.clickable { model.refreshLabels() }.padding(24.dp), color = MaterialTheme.colorScheme.error)
-            }
-            val userLabels = model.labels.filter { it.type == "user" }
-            if (userLabels.isNotEmpty()) {
-                HorizontalDivider(Modifier.padding(horizontal = 24.dp, vertical = 8.dp), color = HmailTheme.colors.outline)
-                userLabels.forEach { label ->
-                    DrawerItem(icon = "tag", label = label.name, selected = model.folder == label.id) {
-                        onClose()
-                        model.chooseFolder(label.id)
+            // 统一视图下标签属于各邮箱私有，隐藏标签区避免跨账户歧义。
+            if (!model.allAccounts) {
+                if (model.mailbox.labelsLoading) {
+                    Text("正在加载标签", Modifier.padding(horizontal = 24.dp, vertical = 8.dp), color = HmailTheme.colors.muted)
+                }
+                model.mailbox.labelsError?.let { error ->
+                    Text(error, Modifier.clickable { model.refreshLabels() }.padding(24.dp), color = MaterialTheme.colorScheme.error)
+                }
+                val userLabels = model.labels.filter { it.type == "user" }
+                if (userLabels.isNotEmpty()) {
+                    HorizontalDivider(Modifier.padding(horizontal = 24.dp, vertical = 8.dp), color = HmailTheme.colors.outline)
+                    userLabels.forEach { label ->
+                        DrawerItem(icon = "tag", label = label.name, selected = model.folder == label.id) {
+                            onClose()
+                            model.chooseFolder(label.id)
+                        }
                     }
                 }
             }
             HorizontalDivider(Modifier.padding(horizontal = 24.dp, vertical = 8.dp), color = HmailTheme.colors.outline)
-            DrawerItem(icon = "tag", label = "管理标签", selected = false) {
-                onClose()
-                onNavigate(Routes.Labels)
+            if (!model.allAccounts) {
+                DrawerItem(icon = "tag", label = "管理标签", selected = false) {
+                    onClose()
+                    onNavigate(Routes.Labels)
+                }
             }
             DrawerItem(icon = "settings", label = "设置", selected = false) {
                 onClose()
@@ -134,6 +140,7 @@ private fun AccountSelector(state: MailboxState, onSelect: (String) -> Unit, onR
             ) {
                 Text(
                     text = current?.email ?: when {
+                        state.active == ALL_ACCOUNTS -> "全部账户"
                         state.accountsLoading -> "正在加载邮箱"
                         state.accountsError != null -> "邮箱加载失败"
                         else -> "尚未连接邮箱"
@@ -147,6 +154,16 @@ private fun AccountSelector(state: MailboxState, onSelect: (String) -> Unit, onR
                 MailIcon("chevron_down", contentDescription = "切换邮箱", tint = HmailTheme.colors.muted)
             }
             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                // 连接两个以上邮箱时才提供「全部账户」统一视图。
+                if (state.accounts.size >= 2) {
+                    DropdownMenuItem(
+                        text = { Text("全部账户", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        onClick = {
+                            expanded = false
+                            if (state.active != ALL_ACCOUNTS) onSelect(ALL_ACCOUNTS)
+                        }
+                    )
+                }
                 state.accounts.forEach { account ->
                     DropdownMenuItem(
                         text = { Text(account.email, maxLines = 1, overflow = TextOverflow.Ellipsis) },

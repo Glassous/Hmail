@@ -18,6 +18,9 @@ fun openExternal(context: Context, url: String) {
     }
 }
 
+/** 「全部账户」在账户选择器里的哨兵值：不是真实账户，用于跨邮箱统一视图。 */
+const val ALL_ACCOUNTS = "__all__"
+
 /** 系统文件夹：键为服务端标签，值为界面名称。 */
 val folders = linkedMapOf(
     "INBOX" to "收件箱",

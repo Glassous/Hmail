@@ -154,8 +154,8 @@ fun InboxScreen(
             val atTop = listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0
             val first = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == listState.firstVisibleItemIndex }
             val anchor = (first?.key as? String)?.removePrefix("mail:")
-            val anchorIndex = rows.indexOfFirst { it.mail.threadId == anchor }
-            val reconnectRows = if (model.accounts.find { it.id == model.active }?.status == "reconnect") 1 else 0
+            val anchorIndex = rows.indexOfFirst { model.threadIdentity(it.mail) == anchor }
+            val reconnectRows = if (model.reconnectAccount != null) 1 else 0
             // Swap the data once: never expose an empty list with only its footer as the anchor.
             val hadRows = animatedMails.isNotEmpty()
             animatedMails = rows
@@ -171,16 +171,17 @@ fun InboxScreen(
             }
         }
         val previous = animatedMails
-        val byId = previous.associateBy { it.mail.threadId }
-        val currentIds = mails.map { it.threadId }.toSet()
+        // 统一视图里不同邮箱可能有相同 threadId，动画差量必须按「邮箱 + 线程」匹配。
+        val byId = previous.associateBy { model.threadIdentity(it.mail) }
+        val currentIds = mails.map { model.threadIdentity(it) }.toSet()
         val updated = mails.map { mail ->
-            (byId[mail.threadId] ?: AnimatedMailEntry(mail, initiallyVisible = previous.isEmpty())).also {
+            (byId[model.threadIdentity(mail)] ?: AnimatedMailEntry(mail, initiallyVisible = previous.isEmpty())).also {
                 it.mail = mail
                 it.visibility.targetState = true
             }
         }.toMutableList()
         previous.forEachIndexed { index, entry ->
-            if (entry.mail.threadId !in currentIds) {
+            if (model.threadIdentity(entry.mail) !in currentIds) {
                 entry.visibility.targetState = false
                 updated.add(index.coerceAtMost(updated.size), entry)
             }
@@ -246,32 +247,34 @@ fun InboxScreen(
         model.query.isNotBlank() -> "搜索结果"
         else -> folders[model.folder] ?: model.labels.find { it.id == model.folder }?.name ?: "邮件"
     }
-    val selectionActions = listOf(
+    val selectionActions = listOfNotNull(
         GlassAction("全选") {
             model.selected.clear()
-            model.selected.addAll(model.items.map { it.threadId })
+            model.selected.addAll(model.items.map { model.threadIdentity(it) })
             model.changed()
         },
         GlassAction("取消选择") {
             model.selected.clear()
             model.changed()
         },
-        GlassAction("归档") { model.work { model.modify(remove = listOf("INBOX")) } },
-        GlassAction("标为已读") { model.work { model.modify(remove = listOf("UNREAD")) } },
-        GlassAction("标为未读") { model.work { model.modify(add = listOf("UNREAD")) } },
-        GlassAction("标记垃圾邮件") { model.work { model.modify(add = listOf("SPAM"), remove = listOf("INBOX")) } },
+        GlassAction("归档") { model.work { model.modifySelected(remove = listOf("INBOX")) } },
+        GlassAction("标为已读") { model.work { model.modifySelected(remove = listOf("UNREAD")) } },
+        GlassAction("标为未读") { model.work { model.modifySelected(add = listOf("UNREAD")) } },
+        GlassAction("标记垃圾邮件") { model.work { model.modifySelected(add = listOf("SPAM"), remove = listOf("INBOX")) } },
         GlassAction(if (model.folder == "TRASH") "恢复邮件" else "移入回收站") {
-            model.work { model.modify(action = if (model.folder == "TRASH") "untrash" else "trash") }
+            model.work { model.modifySelected(action = if (model.folder == "TRASH") "untrash" else "trash") }
         },
-        GlassAction("标签") { onLabelPick() }
+        // 标签按邮箱独立维护，统一视图不提供跨账户打标签。
+        if (model.allAccounts) null else GlassAction("标签") { onLabelPick() }
     )
 
     // 选中项的星标状态：全部已加星时按钮转为"取消星标"，否则统一加星。
-    val selectedMails = mails.filter { it.threadId in selected }
+    val selectedMails = mails.filter { model.threadIdentity(it) in selected }
     val allStarred = selectedMails.isNotEmpty() && selectedMails.all { "STARRED" in it.labels }
 
-    val topActions = if (selected.isEmpty()) listOf(
-        GlassAction("搜索", "search") {
+    val topActions = if (selected.isEmpty()) listOfNotNull(
+        // 统一视图没有跨账户搜索，隐藏搜索入口。
+        if (model.allAccounts) null else GlassAction("搜索", "search") {
             searchText = model.query
             searchOpen = true
         },
@@ -285,7 +288,7 @@ fun InboxScreen(
             tint = if (allStarred) colors.star else colors.muted
         ) {
             model.work {
-                model.modify(
+                model.modifySelected(
                     add = if (allStarred) emptyList() else listOf("STARRED"),
                     remove = if (allStarred) listOf("STARRED") else emptyList()
                 )
@@ -305,15 +308,15 @@ fun InboxScreen(
                 bottom = bottom + BottomClusterHeight + (if (model.hasDraft) FabHeight + BlockGap else 0.dp) + 16.dp
             )
         ) {
-            val activeAccount = model.accounts.find { it.id == model.active }
-            if (activeAccount?.status == "reconnect") {
+            val brokenAccount = model.reconnectAccount
+            if (brokenAccount != null) {
                 item("reconnect") {
                     Text(
-                        text = "连接已失效，点此重新连接",
+                        text = if (model.allAccounts) "${brokenAccount.email} 连接已失效，点此重新连接" else "连接已失效，点此重新连接",
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable {
-                                model.form("ConnectFragment")["email"] = activeAccount.email
+                                model.form("ConnectFragment")["email"] = brokenAccount.email
                                 onConnect()
                             }
                             .padding(horizontal = 20.dp, vertical = 8.dp),
@@ -322,7 +325,7 @@ fun InboxScreen(
                     )
                 }
             }
-            items(animatedMails, key = { "mail:${it.mail.threadId}" }) { entry ->
+            items(animatedMails, key = { "mail:${model.threadIdentity(it.mail)}" }) { entry ->
                 val mail = entry.mail
                 Box(Modifier.animateItem(
                     fadeInSpec = null, fadeOutSpec = null,
@@ -335,7 +338,7 @@ fun InboxScreen(
                     ) {
                         MailRow(
                             enabled = entry.visibility.targetState,
-                            checked = mail.threadId in selected,
+                            checked = model.threadIdentity(mail) in selected,
                             anySelected = selected.isNotEmpty(),
                             unread = "UNREAD" in mail.labels,
                             sender = mail.from.substringBefore('<').replace("\"", "").trim().ifBlank { mail.from },
@@ -343,8 +346,13 @@ fun InboxScreen(
                             subject = mail.subject,
                             snippet = mail.raw.str("snippet"),
                             date = shortDate(mail.raw.str("date")),
+                            // 统一视图里在主标题下方补一行小字，标明这封邮件来自哪个邮箱。
+                            accountLabel = if (model.allAccounts) {
+                                mail.account.ifBlank { model.accounts.find { it.id == mail.accountId }?.email.orEmpty() }.let { if (it.isBlank()) "" else "$it 的邮件" }
+                            } else "",
                             onToggle = {
-                                if (!model.selected.add(mail.threadId)) model.selected.remove(mail.threadId)
+                                val identity = model.threadIdentity(mail)
+                                if (!model.selected.add(identity)) model.selected.remove(identity)
                                 model.changed()
                             },
                             onOpen = {
@@ -356,7 +364,7 @@ fun InboxScreen(
                                         }
                                     } else {
                                         model.messages = emptyList()
-                                        onOpenThread(model.active, mail.threadId)
+                                        onOpenThread(model.mailAccount(mail), mail.threadId)
                                     }
                                 }
                             }
@@ -545,6 +553,7 @@ private fun MailRow(
     subject: String,
     snippet: String,
     date: String,
+    accountLabel: String,
     onToggle: () -> Unit,
     onOpen: () -> Unit
 ) {
@@ -590,6 +599,16 @@ private fun MailRow(
                     color = MaterialTheme.colorScheme.onBackground
                 )
                 Text(date, fontSize = 11.sp, color = colors.muted)
+            }
+            // 统一视图专属：主标题下方一行账户小字，与主标题左对齐。
+            if (accountLabel.isNotBlank()) {
+                Text(
+                    text = accountLabel,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    fontSize = 11.sp,
+                    color = colors.muted
+                )
             }
             Text(
                 text = subject,

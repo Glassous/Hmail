@@ -103,29 +103,30 @@ fun ThreadScreen(
     val messages = if (model.messages.firstOrNull()?.threadId == threadId) model.messages else emptyList()
 
     // 顶栏只留刷新与三点；其余操作收进与主页共用的实色卡片。
-    val cardActions = listOf(
+    val cardActions = listOfNotNull(
         GlassAction("归档", "archive") {
             model.work {
-                model.modify(remove = listOf("INBOX"), threads = listOf(threadId))
+                model.modify(remove = listOf("INBOX"), threads = listOf(threadId), account = aid)
                 onBack()
             }
         },
         GlassAction("标为未读", "unread") {
             model.work {
-                model.modify(add = listOf("UNREAD"), threads = listOf(threadId))
+                model.modify(add = listOf("UNREAD"), threads = listOf(threadId), account = aid)
                 onBack()
             }
         },
         GlassAction("标记垃圾邮件", "SPAM") {
             model.work {
-                model.modify(add = listOf("SPAM"), remove = listOf("INBOX"), threads = listOf(threadId))
+                model.modify(add = listOf("SPAM"), remove = listOf("INBOX"), threads = listOf(threadId), account = aid)
                 onBack()
             }
         },
         GlassAction(if (inTrash) "恢复邮件" else "移入回收站", if (inTrash) "restore" else "trash") {
             pendingTrash = true
         },
-        GlassAction("标签", "tag") { onLabelPick() }
+        // 标签按邮箱独立维护，统一视图下不提供。
+        if (model.allAccounts) null else GlassAction("标签", "tag") { onLabelPick() }
     )
 
     MailPage(
@@ -181,7 +182,8 @@ fun ThreadScreen(
                 model.work {
                     model.modify(
                         action = if (inTrash) "untrash" else "trash",
-                        threads = listOf(threadId)
+                        threads = listOf(threadId),
+                        account = aid
                     )
                     onBack()
                 }
@@ -219,7 +221,8 @@ private fun ThreadMessage(
                     model.modify(
                         add = if (starred) emptyList() else listOf("STARRED"),
                         remove = if (starred) listOf("STARRED") else emptyList(),
-                        ids = listOf(mail.id)
+                        ids = listOf(mail.id),
+                        account = aid
                     )
                 }
             },

@@ -152,12 +152,11 @@ private fun apply(
 ) {
     if (labels.none { it.id == choice }) return
     model.work {
-        val threads = if (threadId.isBlank()) model.selected.toList() else listOf(threadId)
-        model.modify(
-            add = if (remove) emptyList() else listOf(choice),
-            remove = if (remove) listOf(choice) else emptyList(),
-            threads = threads
-        )
+        val add = if (remove) emptyList() else listOf(choice)
+        val drop = if (remove) listOf(choice) else emptyList()
+        // 列表选区按邮箱分组提交；会话内直接作用于该会话所属邮箱。
+        if (threadId.isBlank()) model.modifySelected(add = add, remove = drop)
+        else model.modify(add = add, remove = drop, threads = listOf(threadId))
         onBack()
     }
 }

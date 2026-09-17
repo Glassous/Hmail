@@ -29,7 +29,8 @@ internal class MailListCache(context: Context) {
                 val raw = storage.read(key.storageKey()) ?: return@withLock null
                 val data = JSONObject(raw)
                 if (data.optInt("version") != 1) return@withLock null
-                CachedMailList(data.array("items").objects().map(::Mail).distinctBy { it.threadId },
+                // 统一视图里不同邮箱可能有相同 threadId，去重必须带上所属邮箱。
+                CachedMailList(data.array("items").objects().map(::Mail).distinctBy { it.accountId + ":" + it.threadId },
                     data.str("next"), data.optInt("pages", 1).coerceAtLeast(1))
             }.getOrNull()
         }
