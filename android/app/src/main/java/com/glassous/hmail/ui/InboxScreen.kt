@@ -32,7 +32,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -50,7 +49,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -569,24 +567,9 @@ private fun MailRow(
                 onClick = { if (anySelected) onToggle() else onOpen() },
                 onLongClick = onToggle
             )
-            .padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 14.dp),
+            .padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 14.dp),
         verticalAlignment = Alignment.Top
     ) {
-        Box(
-            modifier = Modifier
-                .size(44.dp)
-                .clip(RoundedCornerShape(percent = 50))
-                .background(colors.selected)
-                .clickable(enabled = enabled, onClick = onToggle),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                text = if (checked) "✓" else sender.take(1).uppercase(),
-                color = colors.onSelected,
-                fontSize = 18.sp
-            )
-        }
-        Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -594,7 +577,7 @@ private fun MailRow(
                     modifier = Modifier.weight(1f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    fontSize = 15.sp,
+                    fontSize = 16.sp,
                     fontWeight = weight,
                     color = MaterialTheme.colorScheme.onBackground
                 )
@@ -606,7 +589,7 @@ private fun MailRow(
                     text = accountLabel,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    fontSize = 11.sp,
+                    fontSize = 13.sp,
                     color = colors.muted
                 )
             }
