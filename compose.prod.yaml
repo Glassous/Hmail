@@ -24,6 +24,7 @@ services:
       MAIL_BACKGROUND_LIMIT: ${MAIL_BACKGROUND_LIMIT:-4}
       MAIL_ACCOUNT_READ_LIMIT: ${MAIL_ACCOUNT_READ_LIMIT:-2}
       MAIL_POOL_IDLE: ${MAIL_POOL_IDLE:-60}
+      MAIL_THREAD_BUDGET: ${MAIL_THREAD_BUDGET:-20}
     volumes:
       - mail_uploads:/tmp/hmail-uploads
     depends_on:

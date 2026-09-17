@@ -1,5 +1,6 @@
 import imaplib
 import json
+import os
 import re
 import smtplib
 import ssl
@@ -280,6 +281,12 @@ FULL_FIELDS = b'(UID FLAGS BODY.PEEK[])'
 SCAN_LIMIT = 200
 PAGE_SIZE = 30
 THREAD_LIMIT = 100
+# Wall-clock budget for reading one conversation. IMAP servers answer header searches with a
+# full scan, so an unbounded walk of a long References chain can take minutes; the reader
+# returns what it already has instead of letting the client hang.
+THREAD_BUDGET = float(os.getenv('MAIL_THREAD_BUDGET', '20'))
+# How long a successful SELECT may be reused for the same folder on the same connection.
+SELECT_CACHE_TTL = 30.0
 
 
 def normalize_subject(value):
@@ -393,6 +400,13 @@ class ImapSmtpProvider:
         return None
 
     def _select(self, wire, expected=None):
+        expected = str(expected) if expected else ''
+        # SELECT/EXAMINE is a full round trip and a thread re-selects the same folder for every
+        # message. The cached state is dropped when another folder is opened and expires after
+        # SELECT_CACHE_TTL, so a UIDVALIDITY change is still noticed on the next read.
+        cached = getattr(self, '_selected', None)
+        if cached and cached[0] == (wire, expected) and time.monotonic() - cached[1] < SELECT_CACHE_TTL:
+            return self._selected_validity
         mailbox = quote(wire)
         if 'CONDSTORE' in self.caps and getattr(self, 'readonly', False):
             mailbox += ' (CONDSTORE)'
@@ -403,15 +417,21 @@ class ImapSmtpProvider:
         validity = (response[0] or b'0').decode() if response else '0'
         modseq = self.imap.response('HIGHESTMODSEQ')[1]
         self.modseq = (modseq[0] or b'0').decode() if modseq else '0'
-        if expected and str(expected) != validity:
+        if expected and expected != validity:
             raise MailError('邮件已不存在，请刷新', 'not_found', 404)
+        self._selected = ((wire, validity), time.monotonic())
+        self._selected_validity = validity
         return validity
 
     # -- primitives ------------------------------------------------------------
 
     def _search(self, *criteria):
         criteria = [item if isinstance(item, bytes) else str(item).encode() for item in criteria]
-        for prefix in ((b'CHARSET', b'UTF-8'), ()):
+        # ASCII criteria need no charset: asking for CHARSET first doubles the round trips on
+        # servers that reject an explicit charset, and every header search here is ASCII.
+        ascii_only = all(byte < 0x80 for item in criteria for byte in item)
+        prefixes = ((),) if ascii_only else ((b'CHARSET', b'UTF-8'), ())
+        for prefix in prefixes:
             try:
                 status, data = self.imap.uid('SEARCH', *prefix, *criteria)
             except (imaplib.IMAP4.error, UnicodeEncodeError):
@@ -592,6 +612,7 @@ class ImapSmtpProvider:
         if parts[0] != 't' or len(parts) < 6:
             raise MailError('无效会话标识', 'validation', 422)
         wire, validity, anchor, kind, key = parts[1], str(parts[2]), str(parts[3]), parts[4], parts[5]
+        deadline = time.monotonic() + THREAD_BUDGET
         self._select(wire, validity)
         rows = self._fetch([anchor.encode()], HEADER_FIELDS)
         if not rows:
@@ -599,8 +620,13 @@ class ImapSmtpProvider:
         anchor_msg = self._parse(rows[0][2])
         uids = {anchor}
         if kind == 'mid':
-            roots = [key, str(anchor_msg.get('Message-ID') or '')] + str(anchor_msg.get('References') or '').split()[:10]
+            # Every HEADER search scans the mailbox on several providers, so only the anchor and
+            # the first references are expanded: the root plus the two nearest ancestors already
+            # cover every message a client keeps in the References chain.
+            roots = [key, str(anchor_msg.get('Message-ID') or '')] + str(anchor_msg.get('References') or '').split()[:3]
             for root in dict.fromkeys(value for value in roots if value):
+                if time.monotonic() > deadline:
+                    break
                 for field in (b'Message-ID', b'References', b'In-Reply-To'):
                     uids.update(item.decode() for item in self._search(b'HEADER', field, root.encode('utf-8')))
         else:
@@ -612,6 +638,9 @@ class ImapSmtpProvider:
         ordered = sorted(uids, key=lambda value: int(value) if value.isdecimal() else 0)[:THREAD_LIMIT]
         messages = []
         for uid in ordered:
+            # Always keep the first message: an empty conversation is worse than a partial one.
+            if messages and time.monotonic() > deadline:
+                break
             message = self.message(self._encode('m', wire, validity, uid))
             message['threadId'] = identifier
             messages.append((int(uid), message))

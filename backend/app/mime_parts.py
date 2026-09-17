@@ -24,7 +24,11 @@ def gmail_message(provider, info):
         body = part.get('body', {})
         headers = {h['name'].lower(): h['value'] for h in part.get('headers', [])}
         name = part.get('filename', '')
-        if name or headers.get('content-disposition', '').lower().startswith('attachment') or kind.startswith('image/'):
+        attached = headers.get('content-disposition', '').lower().startswith('attachment')
+        # Mirrors descriptors(): a text body part keeps `filename`/`name` set by several
+        # mail generators and must stay a body part unless explicitly marked as attachment.
+        body_part = kind in ('text/plain', 'text/html') and not attached
+        if attached or kind.startswith('image/') or kind == 'message/rfc822' or (name and not body_part):
             attachments.append({'id': 'gmail:' + part.get('partId', ''), 'name': name or 'inline-image', 'size': body.get('size', 0), 'type': kind, 'cid': headers.get('content-id', '').strip('<>')})
         elif kind in ('text/plain', 'text/html'):
             raw = unb64(body.get('data', ''))
@@ -102,7 +106,12 @@ def descriptors(structure, prefix=''):
         parameters = disposition[1] if len(disposition) > 1 and isinstance(disposition[1], list) else []
         for i in range(0, len(parameters)-1, 2):
             if str(parameters[i]).lower() == 'filename': name = parameters[i+1]
-    return [{'section': prefix or 'TEXT', 'id': 'mime:' + (prefix or 'TEXT'), 'type': kind, 'name': name or '', 'charset': params.get('charset', 'utf-8'), 'encoding': str(structure[5]).lower(), 'size': int(structure[6] or 0), 'cid': str(structure[3] or '').strip('<>'), 'attachment': bool(name or attached or kind.startswith('image/') or kind == 'message/rfc822')}]
+    # A text/plain or text/html part without `Content-Disposition: attachment` is the message
+    # body. Mailboxes other than Gmail routinely add a stray `name`/`filename` parameter to the
+    # body part; treating that as an attachment leaves the preview with nothing to render.
+    body_part = kind in ('text/plain', 'text/html') and not attached
+    attachment = bool(attached or kind.startswith('image/') or kind == 'message/rfc822' or (name and not body_part))
+    return [{'section': prefix or 'TEXT', 'id': 'mime:' + (prefix or 'TEXT'), 'type': kind, 'name': name or '', 'charset': params.get('charset', 'utf-8'), 'encoding': str(structure[5]).lower(), 'size': int(structure[6] or 0), 'cid': str(structure[3] or '').strip('<>'), 'attachment': attachment}]
 
 
 def imap_parts(provider, identifier):

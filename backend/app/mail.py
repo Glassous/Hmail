@@ -179,8 +179,13 @@ def parse_message(raw, message_id, thread_id, labels=None):
         if part.is_multipart():
             continue
         content = part.get_payload(decode=True) or b''
-        if part.get_filename() or part.get_content_disposition() == 'attachment' or part.get_content_type().startswith('image/'):
-            attachments.append({'id': str(index), 'name': part.get_filename() or 'inline-image', 'size': len(content), 'type': part.get_content_type(), 'cid': str(part.get('Content-ID', '')).strip('<>')})
+        name = part.get_filename()
+        attached = part.get_content_disposition() == 'attachment'
+        # Non-Gmail mailboxes often keep a `name`/`filename` on the text body part; only an
+        # explicit attachment disposition (or a non-text part) turns it into an attachment.
+        body_part = part.get_content_type() in ('text/plain', 'text/html') and not attached
+        if attached or part.get_content_type().startswith('image/') or part.get_content_type() == 'message/rfc822' or (name and not body_part):
+            attachments.append({'id': str(index), 'name': name or 'inline-image', 'size': len(content), 'type': part.get_content_type(), 'cid': str(part.get('Content-ID', '')).strip('<>')})
         elif part.get_content_type() in ('text/plain', 'text/html'):
             try:
                 decoded = content.decode(part.get_content_charset() or 'utf-8', errors='replace')
