@@ -669,6 +669,25 @@ def threads(aid: str, folder: str = 'INBOX', q: str = '', cursor: str = '', user
     return cached_call(user, aid, json.dumps(['list', folder, q, cursor]), 60, lambda p: p.list(folder, q, cursor))
 
 
+@app.get(PREFIX + '/threads')
+def all_threads(folder: str = 'INBOX', cursor: str = '', user=Depends(current_user)):
+    """跨账户统一视图：账户集合只由会话身份派生，客户端无法指定他人账户。"""
+    if len(folder) > 200 or len(cursor) > 2000:
+        raise MailError('列表参数过长', 'validation', 422)
+    if not indexing.ENABLED:
+        raise MailError('统一收件箱需要启用邮件索引服务', 'unsupported', 503)
+    return indexing.list_all_threads(indexing.user_account_ids(user.id), folder, cursor)
+
+
+@app.get(PREFIX + '/threads/sync-status')
+def all_sync_status(folder: str = 'INBOX', user=Depends(current_user)):
+    if len(folder) > 200:
+        raise MailError('同步参数过长', 'validation', 422)
+    if not indexing.ENABLED:
+        raise MailError('统一收件箱需要启用邮件索引服务', 'unsupported', 503)
+    return indexing.all_state(indexing.user_account_ids(user.id), folder)
+
+
 def check_ip_ssrf(ip_str: str):
     ip = ipaddress.ip_address(ip_str)
     if (ip.is_private or ip.is_loopback or ip.is_link_local 

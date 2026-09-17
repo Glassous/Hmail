@@ -97,7 +97,8 @@ class MailThread(Base):
     thread_id: Mapped[str] = mapped_column(Text)
     sort_at: Mapped[float] = mapped_column(Float)
     data: Mapped[str] = mapped_column(Text)
-    __table_args__ = (Index('ix_threads_page', 'folder_key', 'sort_at', 'key'),)
+    # ix_threads_page 服务单账户分页；ix_threads_all_page 服务跨账户统一视图的全局时间排序。
+    __table_args__ = (Index('ix_threads_page', 'folder_key', 'sort_at', 'key'), Index('ix_threads_all_page', 'sort_at', 'key'))
 
 
 class SyncJob(Base):

@@ -65,6 +65,11 @@ def migrate():
                 conn.execute(text('ALTER TABLE gmail_accounts ADD COLUMN created_at TIMESTAMP WITH TIME ZONE'))
             _backfill_account_created_at(conn)
             conn.execute(text('INSERT INTO schema_migrations(version) VALUES (5)'))
+        if not conn.execute(text('SELECT version FROM schema_migrations WHERE version=6')).first():
+            # 跨账户统一视图按 (sort_at, key) 全局排序，folder_key 前导的旧索引无法覆盖这种顺序扫描，
+            # 因此补一个与 folder 无关的排序索引；新库由 Base.metadata.create_all 直接建好。
+            conn.execute(text('CREATE INDEX IF NOT EXISTS ix_threads_all_page ON mail_threads (sort_at, key)'))
+            conn.execute(text('INSERT INTO schema_migrations(version) VALUES (6)'))
 
 
 if __name__ == '__main__':

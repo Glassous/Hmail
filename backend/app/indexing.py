@@ -1,6 +1,7 @@
 """Persistent metadata index. Provider work happens outside database transactions."""
 import hashlib
 import json
+import logging
 import os
 import time
 import uuid
@@ -12,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from .core import Session, Account, MailFolder, MailSummary, MailThread, SyncJob, cache
 from .mail import MailError, b64, unb64
 
+log = logging.getLogger('hmail')
 ENABLED = os.getenv('MAIL_INDEX_ENABLED', 'true').lower() == 'true'
 JOBS_ENABLED = os.getenv('MAIL_SYNC_JOBS_ENABLED', 'true').lower() == 'true'
 
@@ -118,6 +120,104 @@ def list_threads(aid, folder, cursor=''):
         result = {'items': [json.loads(r.data) for r in rows[:30]], 'nextCursor': next_cursor}
         cache.setex(page_key, 30, json.dumps(result))
     result['sync'] = sync_state
+    return result
+
+
+def user_account_ids(user_id):
+    """统一视图的账户集合只从会话身份派生，不接受客户端传入的账户列表。"""
+    with Session() as db:
+        query = select(Account.id).where(Account.user_id == user_id).order_by(Account.created_at.asc().nulls_last(), Account.id.asc())
+        return list(db.scalars(query))
+
+
+def version_fingerprint(versions):
+    """把参与合并的所有 folder 版本压成一个整数：任一账户索引更新都会让跨账户分页游标失效。"""
+    digest = hashlib.sha256(json.dumps(sorted(f'{folder_key}:{version}' for folder_key, version in versions)).encode()).hexdigest()
+    return int(digest[:15], 16)
+
+
+def _merged_state(rows, aids, folder):
+    """把多个账户同一文件夹的同步状态聚合为一个 sync 块，并给出统一视图的版本指纹与待补建账户。"""
+    found = {row.key: row for row, _ in rows}
+    missing = [aid for aid in aids if key(aid, folder) not in found]
+    jobs = [job for _, job in rows if job]
+    statuses = [job.status for job in jobs]
+    # 与单账户 state() 一致：缺少岗位时按"排队中"处理，避免统一视图误报已完成。
+    if 'running' in statuses:
+        status = 'running'
+    elif any(value in ('queued', 'retry') for value in statuses) or len(jobs) < len(aids):
+        status = 'queued'
+    else:
+        status = 'completed'
+    state = {'status': status, 'jobId': None, 'indexVersion': version_fingerprint([(row.key, row.version) for row, _ in rows]),
+             'historyComplete': bool(found) and all(row.complete for row, _ in rows),
+             'lastSyncedAt': max((row.synced_at for row, _ in rows), default=0),
+             'error': next((job.error for job in jobs if job.error), '')}
+    return state, missing
+
+
+def all_state(aids, folder):
+    """统一视图的聚合同步状态；只读，不改动任何同步岗位。"""
+    aids = [aid for aid in dict.fromkeys(aids) if aid]
+    if not aids:
+        return {'status': 'completed', 'jobId': None, 'indexVersion': 0, 'historyComplete': False, 'lastSyncedAt': 0, 'error': ''}
+    with Session() as db:
+        rows = db.execute(select(MailFolder, SyncJob).outerjoin(SyncJob, SyncJob.id == MailFolder.key)
+                          .where(MailFolder.key.in_([key(aid, folder) for aid in aids]))).all()
+        state, _ = _merged_state(rows, aids, folder)
+    return state
+
+
+def list_all_threads(aids, folder, cursor=''):
+    """跨账户统一视图：同一文件夹在多个邮箱之间按时间倒序合并分页。"""
+    aids = [aid for aid in dict.fromkeys(aids) if aid]
+    folder_map = {key(aid, folder): aid for aid in aids}
+    if not folder_map:
+        return {'items': [], 'nextCursor': '', 'sync': all_state([], folder)}
+    with Session() as db:
+        rows = db.execute(select(MailFolder, SyncJob).outerjoin(SyncJob, SyncJob.id == MailFolder.key)
+                          .where(MailFolder.key.in_(list(folder_map)))).all()
+        state, missing = _merged_state(rows, aids, folder)
+        fingerprint = state['indexVersion']
+        folders = list(folder_map)
+        query = select(MailThread).where(MailThread.folder_key.in_(folders))
+        if cursor:
+            try:
+                token = json.loads(unb64(cursor))
+                if token.get('group') != 'all' or token.get('folder') != folder or token.get('fp') != fingerprint:
+                    raise MailError('列表已更新，正在重新加载', 'cursor_expired', 409)
+                date, identifier = float(token['date']), str(token['key'])
+                query = query.where(or_(MailThread.sort_at < date, and_(MailThread.sort_at == date, MailThread.key < identifier)))
+            except (ValueError, TypeError, KeyError):
+                raise MailError('无效分页参数', 'validation', 422) from None
+        page_key = 'index-page-all:' + key(folder, fingerprint, cursor)
+        cached_page = cache.get(page_key)
+        if cached_page:
+            result = json.loads(cached_page)
+            result['sync'] = state
+            return result
+        emails = dict(db.execute(select(Account.id, Account.email).where(Account.id.in_(aids))).all())
+        found = db.scalars(query.order_by(MailThread.sort_at.desc(), MailThread.key.desc()).limit(31)).all()
+        next_cursor = ''
+        if len(found) > 30:
+            last = found[29]
+            next_cursor = b64(json.dumps({'group': 'all', 'folder': folder, 'fp': fingerprint, 'date': last.sort_at, 'key': last.key}).encode())
+        items = []
+        for row in found[:30]:
+            data = json.loads(row.data)
+            aid = folder_map.get(row.folder_key, '')
+            # 摘要里没有账户信息，只在响应内存里注入，绝不回写数据库。
+            data['accountId'] = aid
+            data['account'] = emails.get(aid, '')
+            items.append(data)
+        result = {'items': items, 'nextCursor': next_cursor}
+        cache.setex(page_key, 30, json.dumps(result))
+    result['sync'] = state
+    for aid in missing:
+        try:
+            enqueue(aid, folder, 10, True)
+        except Exception:
+            log.warning('unified_enqueue_failed aid=%s', aid)
     return result
 
 

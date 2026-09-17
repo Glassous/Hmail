@@ -10,12 +10,15 @@ type Account = {id:string; email:string; provider:string; status:string; isDefau
 type MailServer = {host:string; port:number; security:'ssl'|'starttls'}
 type MailPreset = {id:string; name:string; domains:string[]; imap:MailServer; smtp:MailServer; hint:string}
 type Attachment = {id:string; name:string; size:number; messageId?:string}
-type Mail = {id:string; threadId:string; draftId?:string; from:string; to:string; cc:string; bcc:string; subject:string; snippet:string; date:string; labels:string[]; count?:number; text:string; html:string; messageId:string; references:string; attachments:Attachment[]}
+type Mail = {id:string; threadId:string; draftId?:string; from:string; to:string; cc:string; bcc:string; subject:string; snippet:string; date:string; labels:string[]; count?:number; text:string; html:string; messageId:string; references:string; attachments:Attachment[]; accountId?:string; account?:string}
 type Label = {id:string; name:string; type:string}
 const user = ref<any>(null), booting = ref(true), config = ref({oauthEnabled:false, emailCodeEnabled:false, maxAttachmentBytes:18874368, mailProviders:[] as MailPreset[]})
 const authMode = ref('login'), authBusy = ref(false), auth = reactive({email:'', password:'', code:''}), codeBusy = ref(false), codeSent = ref(false), codeCooldown = ref(0)
 const accounts = ref<Account[]>([]), activeId = ref(''), folder = ref('INBOX'), query = ref(''), appliedQuery = ref(''), labels = ref<Label[]>([])
 const items = ref<Mail[]>([]), messages = ref<Mail[]>([]), selected = ref<string[]>([]), activeThread = ref(''), nextCursor = ref(''), cursors = ref(['']), pageIndex = ref(0)
+// 「全部账户」用它作为账户哨兵值；当前打开会话所属账户单独记录，供会话内接口使用。
+const ALL_ACCOUNTS = '__all__'
+const threadAccount = ref('')
 const loading = ref(false), reading = ref(false), syncing = ref(false), sidebar = ref(false), modal = ref(''), error = ref(''), notice = ref(''), theme = ref<'system'|'light'|'dark'>((localStorage.getItem('hmail-theme') as 'system'|'light'|'dark') || 'system')
 const connectionBusy = ref(false), changingPassword = reactive({currentPassword:'',password:''})
 const connection = reactive({email:'',password:'',provider:'',imapHost:'',imapPort:993,imapSecurity:'ssl',smtpHost:'',smtpPort:465,smtpSecurity:'ssl'})
@@ -40,6 +43,18 @@ const pendingActions = reactive(new Set<string>())
 const mutationVersions = new Map<string, number>()
 const aborted = (e:unknown) => e instanceof DOMException && e.name==='AbortError'
 const activeAccount = computed(() => accounts.value.find(a => a.id === activeId.value))
+const isAll = computed(() => activeId.value === ALL_ACCOUNTS)
+const allAccountsReady = computed(() => accounts.value.length >= 2)
+const defaultAccount = computed(() => accounts.value.find(a => a.isDefault) || accounts.value[0])
+const reconnectAccounts = computed(() => accounts.value.filter(a => a.status === 'reconnect'))
+// 邮箱选择器额外展示一个伪账户「全部账户」；真实账户列表保持原样，避免哨兵值外溢。
+const pickerAccounts = computed(() => allAccountsReady.value ? [{id:ALL_ACCOUNTS, email:'全部账户'}, ...accounts.value] : accounts.value)
+// 统一视图里 id/threadId 可能跨账户重复，所有列表 key、选中集合与乐观更新都以「账户 + 标识」为身份。
+const identity = (item:Mail) => `${item.accountId || activeId.value}:${item.id}`
+const threadIdentity = (item:Mail) => `${item.accountId || activeId.value}:${item.threadId}`
+const accountEmail = (aid?:string) => aid ? accounts.value.find(a => a.id === aid)?.email || '' : ''
+const mailAccount = (item:Mail) => item.accountId || (isAll.value ? threadAccount.value || activeId.value : activeId.value)
+const threadAid = computed(() => threadAccount.value || activeId.value)
 const customLabels = computed(() => labels.value.filter(l => l.type === 'user'))
 const presetHint = computed(() => config.value.mailProviders.find(p => p.id === connection.provider)?.hint || (connection.provider === 'custom' ? '请向邮箱服务商确认 IMAP 与 SMTP 服务器地址、端口与加密方式。' : ''))
 const nav = [{id:'INBOX',name:'收件箱',icon:'inbox'},{id:'STARRED',name:'已加星标',icon:'star'},{id:'SENT',name:'已发送',icon:'send'},{id:'DRAFT',name:'草稿',icon:'edit'},{id:'ALL',name:'所有邮件',icon:'mail'},{id:'SPAM',name:'垃圾邮件',icon:'alert'},{id:'TRASH',name:'回收站',icon:'trash'}]
@@ -101,80 +116,102 @@ function switchAuth(mode:string) { authMode.value=mode; auth.password=''; auth.c
 async function logout() { try { await closeCompose(); if(composer.value)return; await api('/auth/logout','POST'); user.value=null; accounts.value=[]; activeId.value=''; modal.value=''; setCsrf('') } catch(e){fail(e)} }
 async function loadAccounts() {
   accounts.value=await api('/gmail-accounts')
+  if(activeId.value===ALL_ACCOUNTS) {
+    // 连接数不足两家时「全部账户」没有意义，回落到默认邮箱。
+    if(accounts.value.length<2) activeId.value=accounts.value.find(a=>a.isDefault)?.id||accounts.value[0]?.id||''
+    return
+  }
   if(!accounts.value.some(a=>a.id===activeId.value)) activeId.value=accounts.value.find(a=>a.isDefault)?.id||accounts.value[0]?.id||''
 }
 watch(activeId, async () => {
   listAbort?.abort(); readAbort?.abort(); ++loadGeneration; ++readGeneration; ++syncGeneration; clearTimeout(syncTimer)
-  reading.value=false; syncing.value=false; folder.value='INBOX'; query.value=''; appliedQuery.value=''; activeThread.value=''; messages.value=[]; labels.value=[]; items.value=[]; resetPages()
+  reading.value=false; syncing.value=false; folder.value='INBOX'; query.value=''; appliedQuery.value=''; activeThread.value=''; threadAccount.value=''; messages.value=[]; labels.value=[]; items.value=[]; resetPages()
   const aid=activeId.value
   if(aid) {
     await Promise.allSettled([loadList(), loadLabels(aid)])
     if(aid===activeId.value)void refresh(false)
   }
 })
-async function loadLabels(aid=activeId.value) { try { const result=await api<Label[]>(path('/labels',aid)); if(aid===activeId.value)labels.value=result }catch(e){if(aid===activeId.value)fail(e)} }
+async function loadLabels(aid=activeId.value) { if(aid===ALL_ACCOUNTS){labels.value=[];return} try { const result=await api<Label[]>(path('/labels',aid)); if(aid===activeId.value)labels.value=result }catch(e){if(aid===activeId.value)fail(e)} }
 function resetPages() { cursors.value=['']; pageIndex.value=0; nextCursor.value=''; selected.value=[] }
 async function loadList() {
   if(!activeId.value)return
   listAbort?.abort(); listAbort=new AbortController()
-  const generation=++loadGeneration, aid=activeId.value, chosenFolder=folder.value; loading.value=true
-  try { const result=await api(path('/threads',aid)+'?'+new URLSearchParams({folder:chosenFolder,q:appliedQuery.value,cursor:cursors.value[pageIndex.value]||''}),'GET',undefined,listAbort.signal); if(generation!==loadGeneration||aid!==activeId.value||chosenFolder!==folder.value)return; items.value=result.items.map((item:Mail)=>pendingActions.has(aid+':'+item.id)?items.value.find(old=>old.id===item.id)||item:item); nextCursor.value=result.nextCursor; selected.value=selected.value.filter(id=>items.value.some(item=>item.id===id)); if(result.sync)indexVersion.value=result.sync.indexVersion }
+  const generation=++loadGeneration, aid=activeId.value, all=isAll.value, chosenFolder=folder.value; loading.value=true
+  try { const result=all?await api('/threads?'+new URLSearchParams({folder:chosenFolder,cursor:cursors.value[pageIndex.value]||''}),'GET',undefined,listAbort.signal):await api(path('/threads',aid)+'?'+new URLSearchParams({folder:chosenFolder,q:appliedQuery.value,cursor:cursors.value[pageIndex.value]||''}),'GET',undefined,listAbort.signal); if(generation!==loadGeneration||aid!==activeId.value||all!==isAll.value||chosenFolder!==folder.value)return; items.value=result.items.map((item:Mail)=>pendingActions.has(identity(item))?items.value.find(old=>identity(old)===identity(item))||item:item); nextCursor.value=result.nextCursor; selected.value=selected.value.filter(key=>items.value.some(item=>identity(item)===key)); if(result.sync)indexVersion.value=result.sync.indexVersion }
   catch(e){if(generation===loadGeneration&&!aborted(e)){if(e instanceof ApiError&&e.code==='cursor_expired'){resetPages();void loadList()}else fail(e)}} finally{if(generation===loadGeneration)loading.value=false}
 }
-async function chooseFolder(id:string) { readAbort?.abort();++readGeneration;reading.value=false;folder.value=id; activeThread.value=''; messages.value=[]; sidebar.value=false; resetPages(); await loadList();void refresh(false) }
-async function search() { readAbort?.abort();++readGeneration;reading.value=false;appliedQuery.value=query.value.trim(); activeThread.value=''; resetPages(); await loadList() }
+async function chooseFolder(id:string) { readAbort?.abort();++readGeneration;reading.value=false;folder.value=id; activeThread.value=''; threadAccount.value=''; messages.value=[]; sidebar.value=false; resetPages(); await loadList();void refresh(false) }
+async function search() { if(isAll.value)return; readAbort?.abort();++readGeneration;reading.value=false;appliedQuery.value=query.value.trim(); activeThread.value=''; threadAccount.value=''; resetPages(); await loadList() }
 async function paginate(direction:number) { if(direction>0){cursors.value[pageIndex.value+1]=nextCursor.value;pageIndex.value++}else pageIndex.value--; await loadList() }
 async function refresh(manual=true) {
-  const aid=activeId.value, chosenFolder=folder.value, generation=++syncGeneration
+  const aid=activeId.value, all=isAll.value, chosenFolder=folder.value, generation=++syncGeneration
   if(!aid)return
   clearTimeout(syncTimer);syncing.value=true
-  const current=()=>generation===syncGeneration&&aid===activeId.value&&chosenFolder===folder.value
+  const current=()=>generation===syncGeneration&&aid===activeId.value&&all===isAll.value&&chosenFolder===folder.value
   const poll=async()=>{
     if(!current())return
     if(document.hidden){syncTimer=setTimeout(poll,2000);return}
     try {
-      const status=await api(path('/sync-status',aid)+'?folder='+encodeURIComponent(chosenFolder))
+      const status=all?await api('/threads/sync-status?folder='+encodeURIComponent(chosenFolder)):await api(path('/sync-status',aid)+'?folder='+encodeURIComponent(chosenFolder))
       if(!current())return
-      if(status.indexVersion!==indexVersion.value){resetPages();await Promise.allSettled([loadList(),loadLabels(aid)])}
+      if(status.indexVersion!==indexVersion.value){resetPages();await Promise.allSettled(all?[loadList()]:[loadList(),loadLabels(aid)])}
       if(!current())return
       syncing.value=['queued','running','retry'].includes(status.status)
       if(status.status==='failed'){syncing.value=false;if(manual)toast('同步暂时失败，已有邮件仍可阅读')}
-      if(status.status==='completed'&&manual){toast('邮箱已刷新');manual=false}
+      if(status.status==='completed'&&manual){toast(all?'全部邮箱已刷新':'邮箱已刷新');manual=false}
       syncTimer=setTimeout(poll,syncing.value?2000:30000)
     }catch(e){if(current()){syncing.value=false;if(manual)fail(e);syncTimer=setTimeout(poll,30000)}}
   }
-  try { await api(path('/sync-jobs',aid)+'?folder='+encodeURIComponent(chosenFolder),'POST');if(current())void poll() }
+  try { if(all)await api('/sync-all','POST');else await api(path('/sync-jobs',aid)+'?folder='+encodeURIComponent(chosenFolder),'POST');if(current())void poll() }
   catch(e){if(current()){syncing.value=false;if(manual)fail(e)}}
 }
 async function openMail(item:Mail) {
   if(folder.value==='DRAFT') { await openDraft(item); return }
   readAbort?.abort();readAbort=new AbortController()
-  const generation=++readGeneration,aid=activeId.value; activeThread.value=item.threadId; reading.value=true; messages.value=[]
-  try { const data=await api<Mail[]>(path('/threads/'+encodeURIComponent(item.threadId),aid),'GET',undefined,readAbort.signal); if(generation!==readGeneration||aid!==activeId.value||activeThread.value!==item.threadId)return; messages.value=data; reading.value=false; if(data.some(m=>m.labels.includes('UNREAD')))void modify([],['UNREAD'],'labels',data.map(m=>m.id)) }
+  const generation=++readGeneration,aid=mailAccount(item),tid=item.threadId
+  threadAccount.value=aid; activeThread.value=tid; reading.value=true; messages.value=[]
+  try { const data=await api<Mail[]>(path('/threads/'+encodeURIComponent(tid),aid),'GET',undefined,readAbort.signal); if(generation!==readGeneration||threadAccount.value!==aid||activeThread.value!==tid)return; messages.value=data; reading.value=false; if(data.some(m=>m.labels.includes('UNREAD')))void modify([],['UNREAD'],'labels',data.map(m=>m.id),aid) }
   catch(e){if(generation===readGeneration&&!aborted(e))fail(e)}finally{if(generation===readGeneration)reading.value=false}
 }
-async function modify(add:string[]=[],remove:string[]=[],action='labels',ids?:string[]) {
-  const targets=ids|| (activeThread.value?messages.value.map(m=>m.id):selected.value)
-  if(!targets.length)return
-  const aid=activeId.value,chosenFolder=folder.value,thread=activeThread.value
-  const threadIds=!ids&&!thread?items.value.filter(m=>selected.value.includes(m.id)).map(m=>m.threadId):[]
-  const snapshots=new Map<Mail,string[]>(), versions=new Map<string,number>()
-  if(targets.some(target=>pendingActions.has(aid+':'+target)))return
-  for(const target of targets){const key=aid+':'+target;if(pendingActions.has(key))return;pendingActions.add(key);const v=(mutationVersions.get(key)||0)+1;mutationVersions.set(key,v);versions.set(key,v)}
-  for(const item of [...items.value,...messages.value])if(targets.includes(item.id)||threadIds.includes(item.threadId)){snapshots.set(item,[...item.labels]);item.labels=[...new Set([...item.labels.filter(l=>!remove.includes(l)),...add])]}
+/** 统一视图的批量操作：按邮件所属账户分组，对各自账户接口分别提交，再合并失败项统一回滚。 */
+async function modify(add:string[]=[],remove:string[]=[],action='labels',ids?:string[],explicitAid?:string) {
+  const context=activeId.value,chosenFolder=folder.value,thread=activeThread.value
+  const groups=new Map<string,{ids:string[];threads:string[]}>()
+  const push=(aid:string,kind:'ids'|'threads',values:string[])=>{if(!values.length)return;const group=groups.get(aid)||{ids:[],threads:[]};group[kind].push(...values);groups.set(aid,group)}
+  if(ids?.length) push(explicitAid||threadAccount.value||context,'ids',ids)
+  else if(thread) push(threadAccount.value||explicitAid||context,'ids',messages.value.map(m=>m.id))
+  else for(const item of items.value.filter(m=>selected.value.includes(identity(m)))) push(mailAccount(item),'threads',[item.threadId])
+  const entries=[...groups]
+  const keys=entries.flatMap(([aid,group])=>[...group.ids,...group.threads].map(value=>`${aid}:${value}`))
+  if(!keys.length)return
+  if(keys.some(key=>pendingActions.has(key)))return
+  const versions=new Map<string,number>()
+  for(const key of keys){pendingActions.add(key);const v=(mutationVersions.get(key)||0)+1;mutationVersions.set(key,v);versions.set(key,v)}
+  const snapshots=new Map<Mail,string[]>()
+  const owns=(item:Mail)=>entries.some(([aid,group])=>mailAccount(item)===aid&&(group.ids.includes(item.id)||group.threads.includes(item.threadId)))
+  for(const item of [...items.value,...messages.value])if(owns(item)){snapshots.set(item,[...item.labels]);item.labels=[...new Set([...item.labels.filter(l=>!remove.includes(l)),...add])]}
+  const failed=new Set<string>()
   try {
-    const result=await api(path('/messages/modify',aid),'POST',{ids:threadIds.length?[]:targets,threadIds,add,remove,action})
-    if(aid!==activeId.value||chosenFolder!==folder.value)return
-    const failed=new Set<string>((result.results||[]).filter((r:any)=>!r.ok).map((r:any)=>r.id))
-    for(const [item,old]of snapshots)if(failed.has(item.id)||failed.has(item.threadId))item.labels=old
+    const outcomes=await Promise.allSettled(entries.map(([aid,group])=>api(path('/messages/modify',aid),'POST',{ids:group.threads.length?[]:group.ids,threadIds:group.threads,add,remove,action})))
+    if(context!==activeId.value||chosenFolder!==folder.value)return
+    let unauthorized:unknown=null
+    outcomes.forEach((outcome,index)=>{
+      const [aid,group]=entries[index]
+      if(outcome.status==='fulfilled'){ for(const row of (outcome.value?.results||[])) if(!row.ok) failed.add(`${aid}:${row.id}`) }
+      else { for(const value of [...group.ids,...group.threads]) failed.add(`${aid}:${value}`); if(outcome.reason instanceof ApiError&&outcome.reason.code==='unauthorized')unauthorized=outcome.reason }
+    })
+    const isFailed=(item:Mail)=>failed.has(`${mailAccount(item)}:${item.id}`)||failed.has(`${mailAccount(item)}:${item.threadId}`)
+    for(const [item,old]of snapshots)if(isFailed(item))item.labels=old
     if(failed.size)toast('部分邮件未能更新，请重试失败项')
-    if(action!=='labels'||remove.includes(chosenFolder)){items.value=items.value.filter(item=>!snapshots.has(item)||failed.has(item.id)||failed.has(item.threadId));if(thread===activeThread.value&&!failed.size){activeThread.value='';messages.value=[]}}
-  }catch(e){if(aid===activeId.value){for(const [item,old]of snapshots)item.labels=old;fail(e)}}
+    if(action!=='labels'||remove.includes(chosenFolder)){items.value=items.value.filter(item=>!snapshots.has(item)||isFailed(item));if(thread&&thread===activeThread.value&&!failed.size){activeThread.value='';threadAccount.value='';messages.value=[]}}
+    if(unauthorized)throw unauthorized
+  }catch(e){if(context===activeId.value){for(const [item,old]of snapshots)item.labels=old;fail(e)}}
   finally{for(const [key,v]of versions)if(mutationVersions.get(key)===v)pendingActions.delete(key)}
 }
-async function star(item:Mail) { await modify(item.labels.includes('STARRED')?[]:['STARRED'],item.labels.includes('STARRED')?['STARRED']:[],'labels',[item.id]) }
-function checkAll() { selected.value=allChecked.value?[]:items.value.map(m=>m.id) }
-async function allowImages(message:Mail) { try{const result=await api(path('/messages/'+encodeURIComponent(message.id))+'?remote=true'); message.html=result.html;toast('已通过安全代理重新加载图片')}catch(e){fail(e)} }
+async function star(item:Mail) { await modify(item.labels.includes('STARRED')?[]:['STARRED'],item.labels.includes('STARRED')?['STARRED']:[],'labels',[item.id],mailAccount(item)) }
+function checkAll() { selected.value=allChecked.value?[]:items.value.map(m=>identity(m)) }
+async function allowImages(message:Mail) { try{const result=await api(path('/messages/'+encodeURIComponent(message.id),threadAid.value)+'?remote=true'); message.html=result.html;toast('已通过安全代理重新加载图片')}catch(e){fail(e)} }
 function onIframeLoad(e: Event) {
   const iframe = e.target as HTMLIFrameElement
   if (!iframe) return
@@ -238,14 +275,16 @@ async function deleteLabel(label:Label) { if(!confirm(`删除标签“${label.na
 
 async function newCompose(mode='', message?:Mail) {
   if(composer.value){restoreCompose();if(mode || message)toast('请先保存并关闭当前写信窗口');return}
-  if(!activeId.value){openConnect();return}
-  Object.assign(draft,freshCompose()); composeAccount.value=activeId.value; savedState.value='';sendUncertain.value=false
+  // 统一视图没有单一发件账户：新邮件用默认邮箱，回复时用该邮件所属邮箱。
+  const account=message?.accountId||(isAll.value?defaultAccount.value?.id||'':activeId.value)
+  if(!account){openConnect();return}
+  Object.assign(draft,freshCompose()); composeAccount.value=account; savedState.value='';sendUncertain.value=false
   if(message){
     draft.subject=/^(re|fwd):/i.test(message.subject)?message.subject:(mode==='forward'?'Fwd: ':'Re: ')+message.subject
     if(mode!=='forward') {
       const address=(value:string)=>value.match(/<([^>]+)>/)?.[1]||value
       draft.to=address(message.from)
-      if(mode==='replyAll'){ const own=activeAccount.value?.email.toLowerCase(); const list=[...message.to.split(','),...message.cc.split(',')].map(address).map(a=>a.trim()).filter(a=>a&&a.toLowerCase()!==own&&a.toLowerCase()!==draft.to.toLowerCase());draft.cc=[...new Set(list)].join(', ') }
+      if(mode==='replyAll'){ const own=accounts.value.find(a=>a.id===composeAccount.value)?.email.toLowerCase(); const list=[...message.to.split(','),...message.cc.split(',')].map(address).map(a=>a.trim()).filter(a=>a&&a.toLowerCase()!==own&&a.toLowerCase()!==draft.to.toLowerCase());draft.cc=[...new Set(list)].join(', ') }
       draft.inReplyTo=message.messageId;draft.references=(message.references+' '+message.messageId).trim();draft.threadId=message.threadId
     } else draft.attachments=message.attachments.map(a=>({...a,messageId:message.id}))
     draft.text='\n\n'+(mode==='forward'?'---------- 转发邮件 ----------':'在 '+message.date+'，'+message.from+' 写道：')+'\n'+message.text.split('\n').map(l=>'> '+l).join('\n')
@@ -257,13 +296,14 @@ async function openDraft(item:Mail) {
   if(composer.value){restoreCompose();toast('请先保存并关闭当前写信窗口');return}
   reading.value=true
   try{
-    const aid=activeId.value,generation=++readGeneration
+    const context=activeId.value,aid=item.accountId||(isAll.value?defaultAccount.value?.id||'':activeId.value),generation=++readGeneration
+    if(!aid)throw new Error('未找到草稿所属邮箱，请刷新后重试')
     const list=item.draftId?[]:await api<any[]>(path('/drafts',aid)); let found=item.draftId?{id:item.draftId}:list.find(d=>d.messageId===item.id||d.id===item.id)
-    if(!found){for(const d of list){const content=await api<Mail>(path('/drafts/'+encodeURIComponent(d.id)));if(content.threadId===item.threadId){found=d;break}}}
+    if(!found){for(const d of list){const content=await api<Mail>(path('/drafts/'+encodeURIComponent(d.id),aid));if(content.threadId===item.threadId){found=d;break}}}
     if(!found)throw new Error('未找到草稿，请刷新后重试')
     const mail=await api<Mail>(path('/drafts/'+encodeURIComponent(found.id),aid))
-    if(aid!==activeId.value||generation!==readGeneration)return
-    await newCompose();Object.assign(draft,{to:mail.to,cc:mail.cc,bcc:mail.bcc,subject:mail.subject==='(无主题)'?'':mail.subject,text:mail.text,draftId:found.id,threadId:mail.threadId,references:mail.references,attachments:mail.attachments.map(a=>({...a,messageId:mail.id}))});composeDirty.value=false;savedState.value='已载入草稿'
+    if(context!==activeId.value||generation!==readGeneration)return
+    await newCompose();composeAccount.value=aid;Object.assign(draft,{to:mail.to,cc:mail.cc,bcc:mail.bcc,subject:mail.subject==='(无主题)'?'':mail.subject,text:mail.text,draftId:found.id,threadId:mail.threadId,references:mail.references,attachments:mail.attachments.map(a=>({...a,messageId:mail.id}))});composeDirty.value=false;savedState.value='已载入草稿'
   }catch(e){fail(e)}finally{reading.value=false}
 }
 function dirty() { composeDirty.value=true;savedState.value='尚未保存';clearTimeout(saveTimer);if(!sendUncertain.value)saveTimer=setTimeout(()=>{void saveDraft()},2000) }
@@ -366,7 +406,7 @@ onUnmounted(()=>{
     <header class="flex h-[76px] shrink-0 items-center gap-3 px-4 md:gap-5 md:px-6">
       <button class="icon-btn lg:hidden" :aria-label="sidebar?'收起侧栏':'打开侧栏'" v-tip="sidebar?'收起侧栏':'打开侧栏'" @click="sidebar=!sidebar"><Icon name="menu" :size="24"/></button>
       <a href="/" class="flex w-auto shrink-0 items-center gap-3 lg:w-[218px]" aria-label="Hmail 首页"><BrandIcon class="hidden lg:block"/><span class="hidden text-[23px] font-semibold tracking-tight sm:block">Hmail<span class="text-blue-600">.</span></span></a>
-      <form class="flex h-12 min-w-0 max-w-3xl flex-1 items-center rounded-full bg-[#eaf0fa] px-4 dark:bg-slate-800" @submit.prevent="search"><Icon name="search" class="shrink-0 text-slate-500"/><input v-model="query" :disabled="!activeId" class="w-full bg-transparent px-3 text-sm outline-none focus-visible:ring-0" placeholder="搜索邮件" aria-label="搜索邮件，支持 from:、to:、subject: 前缀"/><button v-if="query" type="button" class="text-slate-500" aria-label="清空搜索" v-tip="'清空搜索'" @click="query='';search()"><Icon name="close" :size="16"/></button></form>
+      <form v-if="!isAll" class="flex h-12 min-w-0 max-w-3xl flex-1 items-center rounded-full bg-[#eaf0fa] px-4 dark:bg-slate-800" @submit.prevent="search"><Icon name="search" class="shrink-0 text-slate-500"/><input v-model="query" :disabled="!activeId" class="w-full bg-transparent px-3 text-sm outline-none focus-visible:ring-0" placeholder="搜索邮件" aria-label="搜索邮件，支持 from:、to:、subject: 前缀"/><button v-if="query" type="button" class="text-slate-500" aria-label="清空搜索" v-tip="'清空搜索'" @click="query='';search()"><Icon name="close" :size="16"/></button></form>
 
     </header>
     <div class="flex min-h-0 flex-1 pb-3 pl-3 pr-3 lg:pl-0">
@@ -374,11 +414,11 @@ onUnmounted(()=>{
       <aside class="fixed inset-y-0 left-0 z-40 flex w-[260px] shrink-0 flex-col bg-[#f6f8fc] px-4 pb-4 pt-6 transition-transform dark:bg-[#10151e] lg:static lg:translate-x-0 lg:pt-1" :class="sidebar?'translate-x-0':'-translate-x-full'">
         <a href="/" class="mb-5 flex shrink-0 items-center gap-3 px-2 lg:hidden" aria-label="Hmail 首页"><BrandIcon :size="40"/><span class="text-lg font-semibold tracking-tight">Hmail<span class="text-violet-500">.</span></span></a>
         <button class="mb-6 ml-1 flex shrink-0 w-fit items-center gap-4 rounded-2xl bg-[#c2e7ff] px-6 py-4 font-medium text-[#16394f] shadow-sm transition hover:shadow-md" @click="newCompose()"><Icon name="edit" :size="22"/>写邮件</button>
-        <MailboxPicker v-model="activeId" :accounts="accounts" :hidden="!sidebar"/>
+        <MailboxPicker v-model="activeId" :accounts="pickerAccounts" :hidden="!sidebar"/>
         <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <nav class="space-y-1"><button v-for="n in nav" :key="n.id" class="flex w-full items-center gap-4 rounded-full px-5 py-2.5 text-sm transition" :class="folder===n.id?'bg-[#d3e3fd] font-semibold text-[#17365e] dark:bg-blue-900/50 dark:text-blue-200':'text-slate-600 hover:bg-slate-200/60 dark:text-slate-400 dark:hover:bg-slate-800'" :disabled="!activeId" @click="chooseFolder(n.id)"><Icon :name="n.icon" :size="19"/>{{n.name}}<span v-if="n.id==='INBOX'&&folder==='INBOX'&&items.filter(m=>m.labels.includes('UNREAD')).length" class="ml-auto text-xs">{{items.filter(m=>m.labels.includes('UNREAD')).length}}</span></button></nav>
-        <div class="mt-7 flex items-center justify-between px-5"><span class="text-xs font-medium text-slate-500">标签</span><button class="text-slate-500 hover:text-blue-600" aria-label="新建标签" v-tip="'新建标签'" :disabled="!activeId" @click="labelEdit=null;labelName='';modal='label'"><Icon name="plus" :size="17"/></button></div>
-        <div class="mt-2"><div v-for="label in customLabels" :key="label.id" class="group flex items-center rounded-full" :class="folder===label.id?'bg-blue-100 dark:bg-blue-900/30':''"><button class="flex min-w-0 flex-1 items-center gap-4 px-5 py-2.5 text-sm text-slate-500" @click="chooseFolder(label.id)"><Icon name="tag" :size="17" class="shrink-0"/><span class="truncate">{{label.name}}</span></button><button class="mr-2 text-slate-400 opacity-0 focus:opacity-100 group-hover:opacity-100" :aria-label="'编辑标签 '+label.name" v-tip="'编辑标签'" @click="labelEdit=label;labelName=label.name;modal='label'"><Icon name="edit" :size="14"/></button></div><p v-if="!customLabels.length" class="px-5 py-3 text-xs text-slate-400">用标签整理你的邮件</p></div>
+        <div v-if="!isAll" class="mt-7 flex items-center justify-between px-5"><span class="text-xs font-medium text-slate-500">标签</span><button class="text-slate-500 hover:text-blue-600" aria-label="新建标签" v-tip="'新建标签'" :disabled="!activeId" @click="labelEdit=null;labelName='';modal='label'"><Icon name="plus" :size="17"/></button></div>
+        <div v-if="!isAll" class="mt-2"><div v-for="label in customLabels" :key="label.id" class="group flex items-center rounded-full" :class="folder===label.id?'bg-blue-100 dark:bg-blue-900/30':''"><button class="flex min-w-0 flex-1 items-center gap-4 px-5 py-2.5 text-sm text-slate-500" @click="chooseFolder(label.id)"><Icon name="tag" :size="17" class="shrink-0"/><span class="truncate">{{label.name}}</span></button><button class="mr-2 text-slate-400 opacity-0 focus:opacity-100 group-hover:opacity-100" :aria-label="'编辑标签 '+label.name" v-tip="'编辑标签'" @click="labelEdit=label;labelName=label.name;modal='label'"><Icon name="edit" :size="14"/></button></div><p v-if="!customLabels.length" class="px-5 py-3 text-xs text-slate-400">用标签整理你的邮件</p></div>
         </div>
         <div class="mt-auto shrink-0 space-y-2 pt-4">
           <div class="space-y-1.5">
@@ -410,12 +450,12 @@ onUnmounted(()=>{
           <div class="flex flex-1 flex-col items-center justify-center px-6 pb-12 text-center"><div class="relative mb-8"><div class="absolute -inset-5 rounded-full bg-blue-50 dark:bg-blue-900/10"></div><div class="relative flex h-24 w-24 items-center justify-center rounded-[28px] bg-[#e8f0fe] text-blue-500 dark:bg-blue-900/40"><Icon name="inbox" :size="44"/></div><span class="absolute -bottom-2 -right-2 rounded-full border-4 border-white bg-blue-600 p-2 text-white dark:border-slate-800"><Icon name="plus" :size="16"/></span></div><p class="mb-3 text-xs font-medium uppercase tracking-[.22em] text-blue-500">Your inbox starts here</p><h1 class="text-2xl font-semibold tracking-tight">欢迎来到你的新收件箱</h1><p class="mt-4 max-w-sm text-sm leading-7 text-slate-500">连接一个邮箱，就能在这里收发邮件、整理文件夹，找回专注的节奏。</p><button class="primary mt-7" @click="openConnect"><Icon name="plus" :size="18"/>连接邮箱</button><div class="mt-10 flex gap-7 text-xs text-slate-400"><span class="flex items-center gap-2"><Icon name="shield" :size="15"/>凭据加密</span><span class="flex items-center gap-2"><Icon name="grid" :size="15"/>多邮箱切换</span></div></div>
         </template>
         <template v-else>
-          <div v-if="activeAccount?.status==='reconnect'" class="flex items-center gap-3 bg-amber-50 px-5 py-3 text-xs text-amber-800 dark:bg-amber-950/40"><Icon name="alert" :size="16"/>连接已失效，请重新连接或更新密码/授权码。<button class="ml-auto underline" @click="openConnect">重新连接</button></div>
+          <div v-if="isAll?reconnectAccounts.length>0:activeAccount?.status==='reconnect'" class="flex items-center gap-3 bg-amber-50 px-5 py-3 text-xs text-amber-800 dark:bg-amber-950/40"><Icon name="alert" :size="16"/>{{isAll?reconnectAccounts.map(a=>a.email).join('、')+' 连接已失效，请重新连接。':'连接已失效，请重新连接或更新密码/授权码。'}}<button class="ml-auto underline" @click="openConnect">重新连接</button></div>
           <div class="flex min-h-16 shrink-0 items-center gap-1 overflow-x-auto border-b divider px-3 sm:px-5">
-            <button v-if="activeThread" class="icon-btn" aria-label="返回列表" v-tip="'返回列表'" @click="activeThread='';messages=[]"><Icon name="back"/></button><label v-else class="flex h-10 w-9 items-center justify-center"><input type="checkbox" :checked="allChecked" :disabled="!items.length" aria-label="选择本页全部邮件" class="h-4 w-4 accent-blue-600" @change="checkAll"/></label>
+            <button v-if="activeThread" class="icon-btn" aria-label="返回列表" v-tip="'返回列表'" @click="activeThread='';threadAccount='';messages=[]"><Icon name="back"/></button><label v-else class="flex h-10 w-9 items-center justify-center"><input type="checkbox" :checked="allChecked" :disabled="!items.length" aria-label="选择本页全部邮件" class="h-4 w-4 accent-blue-600" @change="checkAll"/></label>
             <button class="icon-btn" :disabled="syncing||!activeId" aria-label="刷新邮箱" v-tip="syncing?'正在刷新…':'刷新邮箱'" @click="refresh()"><Icon name="refresh" :class="syncing?'animate-spin':''" :size="18"/></button>
-            <template v-if="selected.length||activeThread"><span class="mx-1 h-5 border-l divider"></span><button class="icon-btn" :disabled="actionBusy" aria-label="归档" v-tip="'归档'" @click="modify([],['INBOX'])"><Icon name="archive" :size="18"/></button><button class="icon-btn" :disabled="actionBusy" aria-label="标记垃圾邮件" v-tip="'标记为垃圾邮件'" @click="modify(['SPAM'],['INBOX'])"><Icon name="alert" :size="18"/></button><button class="icon-btn" :disabled="actionBusy" :aria-label="folder==='TRASH'?'恢复邮件':'移入回收站'" v-tip="folder==='TRASH'?'恢复邮件':'移入回收站'" @click="modify([],[],folder==='TRASH'?'untrash':'trash')"><Icon :name="folder==='TRASH'?'inbox':'trash'" :size="18"/></button><button class="icon-btn" :disabled="actionBusy" aria-label="标记为未读" v-tip="'标记为未读'" @click="modify(['UNREAD'])"><Icon name="mail" :size="18"/></button><button class="icon-btn" :disabled="actionBusy" aria-label="应用标签" v-tip="'应用标签'" @click="labelChoice=customLabels[0]?.id||'';modal='apply-label'"><Icon name="tag" :size="18"/></button></template>
-            <span v-else class="ml-2 hidden text-sm font-medium sm:block">{{folderTitle}}</span>
+            <template v-if="selected.length||activeThread"><span class="mx-1 h-5 border-l divider"></span><button class="icon-btn" :disabled="actionBusy" aria-label="归档" v-tip="'归档'" @click="modify([],['INBOX'])"><Icon name="archive" :size="18"/></button><button class="icon-btn" :disabled="actionBusy" aria-label="标记垃圾邮件" v-tip="'标记为垃圾邮件'" @click="modify(['SPAM'],['INBOX'])"><Icon name="alert" :size="18"/></button><button class="icon-btn" :disabled="actionBusy" :aria-label="folder==='TRASH'?'恢复邮件':'移入回收站'" v-tip="folder==='TRASH'?'恢复邮件':'移入回收站'" @click="modify([],[],folder==='TRASH'?'untrash':'trash')"><Icon :name="folder==='TRASH'?'inbox':'trash'" :size="18"/></button><button class="icon-btn" :disabled="actionBusy" aria-label="标记为未读" v-tip="'标记为未读'" @click="modify(['UNREAD'])"><Icon name="mail" :size="18"/></button><button v-if="!isAll" class="icon-btn" :disabled="actionBusy" aria-label="应用标签" v-tip="'应用标签'" @click="labelChoice=customLabels[0]?.id||'';modal='apply-label'"><Icon name="tag" :size="18"/></button></template>
+            <span v-else class="ml-2 hidden text-sm font-medium sm:block">{{isAll?'全部账户 · '+folderTitle:folderTitle}}</span>
             <div v-if="!activeThread" class="ml-auto flex shrink-0 items-center gap-1"><span class="mr-2 hidden text-xs text-slate-400 sm:inline">{{items.length?`第 ${pageIndex+1} 页 · ${items.length} 个会话`:'暂无邮件'}}</span><button class="icon-btn" :disabled="pageIndex===0||loading" aria-label="上一页" v-tip="'上一页'" @click="paginate(-1)"><Icon name="chevron" :size="16" class="rotate-180"/></button><button class="icon-btn" :disabled="!nextCursor||loading" aria-label="下一页" v-tip="'下一页'" @click="paginate(1)"><Icon name="chevron" :size="16"/></button></div>
           </div>
           <div v-if="loading&&!items.length&&!activeThread||reading" class="flex flex-1 items-center justify-center gap-3 text-sm text-slate-400"><Icon name="refresh" class="animate-spin"/>正在加载邮件…</div>
@@ -431,9 +471,9 @@ onUnmounted(()=>{
                     @load="onIframeLoad"
                   ></iframe>
                 </div>
-                <pre v-else class="whitespace-pre-wrap break-words font-sans text-sm leading-7">{{message.text||'（无正文）'}}</pre><div v-if="message.attachments.length" class="mt-6 flex flex-wrap gap-2"><a v-for="attachment in message.attachments" :key="attachment.id" :href="'/api/v1'+path('/messages/'+encodeURIComponent(message.id)+'/attachments/'+encodeURIComponent(attachment.id))" class="flex max-w-full items-center gap-3 rounded-xl border divider px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800"><Icon name="attachment" :size="18" class="text-slate-400"/><span class="min-w-0"><span class="block truncate text-xs font-medium">{{attachment.name}}</span><span class="caption">{{sizeText(attachment.size)}}</span></span><Icon name="download" :size="15" class="text-slate-400"/></a></div><div class="mt-6 flex flex-wrap gap-2"><button class="secondary" @click="newCompose('reply',message)"><Icon name="reply" :size="16"/>回复</button><button class="secondary" @click="newCompose('replyAll',message)"><Icon name="replyAll" :size="16"/>回复全部</button><button class="secondary" @click="newCompose('forward',message)"><Icon name="forward" :size="16"/>转发</button></div></div></article></div>
+                <pre v-else class="whitespace-pre-wrap break-words font-sans text-sm leading-7">{{message.text||'（无正文）'}}</pre><div v-if="message.attachments.length" class="mt-6 flex flex-wrap gap-2"><a v-for="attachment in message.attachments" :key="attachment.id" :href="'/api/v1'+path('/messages/'+encodeURIComponent(message.id)+'/attachments/'+encodeURIComponent(attachment.id),threadAid)" class="flex max-w-full items-center gap-3 rounded-xl border divider px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800"><Icon name="attachment" :size="18" class="text-slate-400"/><span class="min-w-0"><span class="block truncate text-xs font-medium">{{attachment.name}}</span><span class="caption">{{sizeText(attachment.size)}}</span></span><Icon name="download" :size="15" class="text-slate-400"/></a></div><div class="mt-6 flex flex-wrap gap-2"><button class="secondary" @click="newCompose('reply',message)"><Icon name="reply" :size="16"/>回复</button><button class="secondary" @click="newCompose('replyAll',message)"><Icon name="replyAll" :size="16"/>回复全部</button><button class="secondary" @click="newCompose('forward',message)"><Icon name="forward" :size="16"/>转发</button></div></div></article></div>
           <div v-else-if="!items.length" class="flex flex-1 flex-col items-center justify-center px-6 pb-12 text-center"><span class="mb-5 flex h-20 w-20 items-center justify-center rounded-full bg-slate-50 text-slate-300 dark:bg-slate-800 dark:text-slate-600"><Icon :name="appliedQuery?'search':'inbox'" :size="34"/></span><h2 class="text-lg font-medium">{{appliedQuery?'没有找到匹配的邮件':'这里清清爽爽'}}</h2><p class="mt-3 text-sm text-slate-400">{{appliedQuery?'试试其他关键词，或使用 from:、subject: 搜索。':'当前文件夹暂无邮件。新邮件会在刷新后出现。'}}</p></div>
-          <div v-else class="flex-1 overflow-y-auto"><div v-if="appliedQuery" class="border-b divider px-6 py-3 text-xs text-slate-400">搜索结果：{{appliedQuery}}</div><div v-for="item in items" :key="item.threadId" class="group flex cursor-pointer items-center gap-3 border-b divider px-4 py-3.5 transition hover:relative hover:z-10 hover:shadow-[0_1px_4px_#00000016] sm:gap-4 sm:px-5" :class="selected.includes(item.id)?'bg-blue-50 dark:bg-blue-900/30':item.labels.includes('UNREAD')?'bg-white dark:bg-[#1e2939]':'bg-[#f8faff] dark:bg-[#17202c]'" @click="openMail(item)"><input v-model="selected" type="checkbox" :value="item.id" :aria-label="'选择 '+item.subject" class="h-4 w-4 shrink-0 accent-blue-600" @click.stop/><button class="shrink-0 text-slate-300" :aria-label="'切换星标 '+item.subject" v-tip="item.labels.includes('STARRED')?'取消星标':'加星标'" @click.stop="star(item)"><Icon name="star" :size="18" :class="item.labels.includes('STARRED')?'fill-amber-400 text-amber-400':''"/></button><button class="flex min-w-0 flex-1 flex-col gap-1 text-left md:flex-row md:items-center md:gap-6" @click.stop="openMail(item)"><span class="w-full shrink-0 truncate text-sm md:w-40" :class="item.labels.includes('UNREAD')?'font-semibold':''">{{senderName(item.from)}} <span v-if="(item.count||0)>1" class="text-xs text-slate-400">{{item.count}}</span></span><span class="min-w-0 truncate text-sm"><span :class="item.labels.includes('UNREAD')?'font-semibold':''">{{item.subject}}</span><span v-if="item.snippet" class="ml-2 text-slate-400">— {{item.snippet}}</span></span></button><span class="shrink-0 text-xs" :class="item.labels.includes('UNREAD')?'font-semibold text-slate-600 dark:text-slate-200':'text-slate-400'">{{shortDate(item.date)}}</span></div><div class="px-5 py-8 text-center text-[11px] text-slate-400">{{activeAccount?.email}}</div></div>
+          <div v-else class="flex-1 overflow-y-auto"><div v-if="appliedQuery" class="border-b divider px-6 py-3 text-xs text-slate-400">搜索结果：{{appliedQuery}}</div><template v-for="item in items" :key="threadIdentity(item)"><div class="group flex cursor-pointer items-center gap-3 border-b divider px-4 py-3.5 transition hover:relative hover:z-10 hover:shadow-[0_1px_4px_#00000016] sm:gap-4 sm:px-5" :class="selected.includes(identity(item))?'bg-blue-50 dark:bg-blue-900/30':item.labels.includes('UNREAD')?'bg-white dark:bg-[#1e2939]':'bg-[#f8faff] dark:bg-[#17202c]'" @click="openMail(item)"><input v-model="selected" type="checkbox" :value="identity(item)" :aria-label="'选择 '+item.subject" class="h-4 w-4 shrink-0 accent-blue-600" @click.stop/><button class="shrink-0 text-slate-300" :aria-label="'切换星标 '+item.subject" v-tip="item.labels.includes('STARRED')?'取消星标':'加星标'" @click.stop="star(item)"><Icon name="star" :size="18" :class="item.labels.includes('STARRED')?'fill-amber-400 text-amber-400':''"/></button><button class="flex min-w-0 flex-1 flex-col gap-1 text-left md:flex-row md:items-center md:gap-6" @click.stop="openMail(item)"><span class="block w-full shrink-0" :class="isAll?'md:w-48':'md:w-40'"><span class="block truncate text-sm" :class="item.labels.includes('UNREAD')?'font-semibold':''">{{senderName(item.from)}} <span v-if="(item.count||0)>1" class="text-xs text-slate-400">{{item.count}}</span></span><span v-if="isAll" class="block truncate text-[11px] text-slate-400 dark:text-slate-500">{{(item.account||accountEmail(item.accountId))+' 的邮件'}}</span></span><span class="min-w-0 truncate text-sm"><span :class="item.labels.includes('UNREAD')?'font-semibold':''">{{item.subject}}</span><span v-if="item.snippet" class="ml-2 text-slate-400">— {{item.snippet}}</span></span></button><span class="shrink-0 text-xs" :class="item.labels.includes('UNREAD')?'font-semibold text-slate-600 dark:text-slate-200':'text-slate-400'">{{shortDate(item.date)}}</span></div></template><div class="px-5 py-8 text-center text-[11px] text-slate-400">{{isAll?'全部账户':activeAccount?.email}}</div></div>
         </template>
       </main>
     </div>
